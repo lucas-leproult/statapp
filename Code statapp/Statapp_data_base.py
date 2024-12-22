@@ -69,3 +69,72 @@ plt.xlabel("Date")
 plt.ylabel("Rendement logarithmiques")
 plt.legend()
 plt.show()"""
+
+
+
+
+####################### SMV ###############################
+
+################ Annualisation ################
+n_days = 252  # Moyenne des jours ouvrés sur les marchés financiers
+
+# 1. Rendements moyens annualisés
+mean_returns = df_log_returns.mean() * n_days
+
+# 2. Matrice de covariance annualisée
+cov_matrix = df_log_returns.cov() * n_days
+
+
+
+################ Optimisation numerique avec minimize de scipy.optimize  ################
+
+def negative_sharpe_ratio(weights, mean_returns, cov_matrix, risk_free_rate):
+    portfolio_return = np.dot(weights, mean_returns)  # Rendement du portefeuille
+    portfolio_volatility = np.sqrt(weights.T @ cov_matrix @ weights)  # Volatilité du portefeuille
+    sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
+    return -sharpe_ratio
+
+# Paramètres de l'optimisation
+num_assets = len(mean_returns) - 1  # Exclut le T-Bond
+risk_free_rate = mean_returns["^TYX"]  # Rendement sans risque annualisé
+initial_weights = np.ones(num_assets) / num_assets  # Poids égaux comme point de départ
+
+# Contraintes : la somme des poids doit être égale à 1
+constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
+
+# Bornes : chaque poids doit être compris entre 0 et 1
+bounds = tuple((0, 1) for _ in range(num_assets))
+
+# Minimiser le ratio de Sharpe négatif
+optimized_result = minimize(
+    negative_sharpe_ratio,
+    initial_weights,
+    args=(mean_returns[:-1], cov_matrix.iloc[:-1, :-1], risk_free_rate),
+    method='SLSQP',
+    bounds=bounds,
+    constraints=constraints
+)
+
+# Résultat de l'optimisation
+optimal_weights = optimized_result.x
+# Calculer le ratio de Sharpe optimal
+optimal_sharpe_ratio = -optimized_result.fun
+
+
+################ DEBUT ACP  ################
+
+data_acp = df_log_returns.iloc[:, :-1]  # Retrait du T-Bond
+
+# Standardisation et nettoyage des données
+data_acp= data_acp.dropna()   # Pour l'instant j'ai simplement supprimé les lignes avec des NaN (environ 12 lignes)
+scaler = StandardScaler()
+data_standardized = scaler.fit_transform(data_acp) 
+
+# Initialisation et execution de l'ACP
+pca = PCA()
+pca.fit(data_standardized)
+
+# Les contributions des composantes principales
+components = pca.transform(data_standardized)
+explained_variance = pca.explained_variance_ratio_
+
