@@ -12,6 +12,7 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
+from scipy.optimize import minimize
 
 
 #definir ticker
@@ -121,20 +122,5 @@ optimal_weights = optimized_result.x
 optimal_sharpe_ratio = -optimized_result.fun
 
 
-################ DEBUT ACP  ################
 
-data_acp = df_log_returns.iloc[:, :-1]  # Retrait du T-Bond
-
-# Standardisation et nettoyage des données
-data_acp= data_acp.dropna()   # Pour l'instant j'ai simplement supprimé les lignes avec des NaN (environ 12 lignes)
-scaler = StandardScaler()
-data_standardized = scaler.fit_transform(data_acp) 
-
-# Initialisation et execution de l'ACP
-pca = PCA()
-pca.fit(data_standardized)
-
-# Les contributions des composantes principales
-components = pca.transform(data_standardized)
-explained_variance = pca.explained_variance_ratio_
 
