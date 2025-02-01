@@ -113,7 +113,7 @@ plt.xticks(components)
 plt.tight_layout()
 plt.show()
 
-# (Optionnel) Contributions de chaque actif dans la 1ère composante
+# Contributions de chaque actif dans la 1ère composante
 first_component_loadings = pca.components_[0]
 plt.figure(figsize=(10, 5))
 plt.bar(tickers, first_component_loadings, color='orange')
