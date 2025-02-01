@@ -1,0 +1,164 @@
+import yfinance as yf
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+from tabulate import tabulate
+from statsmodels.tsa.stattools import adfuller, kpss
+
+# Import de PCA (Analyse en Composantes Principales)
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+def pprint(df):
+    print(tabulate(df, headers='keys', tablefmt='psql'))
+
+# Définition des tickers et des noms des entreprises
+tickers_titres = {
+    "AC.PA": "Air Liquide",
+    "MC.PA": "LVMH",
+    "SAN.PA": "Sanofi",
+    "CS.PA": "Axa",
+    "OR.PA": "L'Oréal",
+    "EL.PA": "Essilor Luxotica",
+    "VIE.PA": "Veolia Environnement",
+    "ORA.PA": "Orange",
+    "VIV.PA": "Vivendi",
+    "SAF.PA": "Safran",
+    "^TYX": "US 30 Year T-Bond"
+}
+
+# Récupération des données boursières
+tickers = tuple(tickers_titres.keys())
+df_all = yf.download(tickers, start="2014-01-01", end="2016-12-31")
+
+# Extraction des cours de clôture journaliers
+df_close = df_all["Close"]
+
+# Calcul des rendements
+df_returns = df_close.pct_change().dropna()
+
+# Calcul de la Matrice de Covariance et Annualisation
+n_days = 252  # Nombre de jours de trading par an
+mean_returns = df_returns.mean() * n_days  # Rendements moyens annualisés
+cov_matrix = df_returns.cov() * n_days  # Matrice de covariance annualisée
+
+# Fonction pour minimiser le ratio de Sharpe négatif
+def negative_sharpe_ratio(weights, mean_returns, cov_matrix, risk_free_rate):
+    portfolio_return = np.dot(weights, mean_returns)  # Rendement du portefeuille
+    portfolio_volatility = np.sqrt(weights.T @ cov_matrix @ weights)  # Volatilité du portefeuille
+    sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
+    return -sharpe_ratio  # On minimise le Sharpe négatif
+
+# Paramètres de l'optimisation
+num_assets = len(mean_returns)
+risk_free_rate = 0.02
+initial_weights = np.ones(num_assets) / num_assets  # Poids égaux au départ
+
+# Contraintes : la somme des poids doit être égale à 1
+constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
+
+# Bornes : chaque poids doit être compris entre 1% et 40%
+bounds = tuple((0.01, 0.4) for _ in range(num_assets))
+
+# Optimisation avec la minimisation du ratio de Sharpe négatif
+optimized_result = minimize(
+    negative_sharpe_ratio,
+    initial_weights,
+    args=(mean_returns, cov_matrix, risk_free_rate),
+    method='SLSQP',
+    bounds=bounds,
+    constraints=constraints
+)
+
+# Résultat de l'optimisation
+optimal_weights = optimized_result.x
+optimal_sharpe_ratio = -optimized_result.fun
+
+# === Affichage des résultats de l'optimisation ===
+print("\nRatio de Sharpe optimal :", optimal_sharpe_ratio)
+print("\nPoids optimaux du portefeuille :")
+for ticker, weight in zip(tickers, optimal_weights):
+    print(f"{ticker}: {weight:.2%}")
+
+# === Visualisation des poids optimaux sous forme d'histogramme ===
+plt.figure(figsize=(10, 5))
+plt.bar(tickers, optimal_weights * 100, color='royalblue')
+plt.xlabel("Actifs")
+plt.ylabel("Poids optimal (%)")
+plt.title("Répartition des poids du portefeuille optimisé")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# === Ajout de l'Analyse en Composantes Principales (ACP) ===
+# 1. On standardise les rendements pour une ACP cohérente (optionnel mais conseillé)
+X = df_returns.dropna()
+X_scaled = StandardScaler().fit_transform(X)
+
+# 2. On applique la PCA
+pca = PCA()
+pca.fit(X_scaled)
+
+# 3. Variance expliquée par chaque composante
+explained_var = pca.explained_variance_ratio_
+components = np.arange(1, len(explained_var) + 1)
+
+plt.figure(figsize=(8, 4))
+plt.bar(components, explained_var * 100, color='skyblue')
+plt.xlabel("Composantes principales")
+plt.ylabel("Variance expliquée (%)")
+plt.title("Variance expliquée par les Composantes Principales (ACP)")
+plt.xticks(components)
+plt.tight_layout()
+plt.show()
+
+# (Optionnel) Contributions de chaque actif dans la 1ère composante
+first_component_loadings = pca.components_[0]
+plt.figure(figsize=(10, 5))
+plt.bar(tickers, first_component_loadings, color='orange')
+plt.xlabel("Actifs")
+plt.ylabel("Poids dans la 1ère composante")
+plt.title("Contributions des actifs dans la 1ère composante principale")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# === Tests de séries temporelles (KPSS et ADF) ===
+def testKPSS(ticker):
+    df = df_returns[ticker].dropna()
+    kpss_stat, p_value, lags, critical_values = kpss(df, regression='c')
+    print(f"KPSS pour {ticker} :")
+    print(f"  Statistique : {kpss_stat}")
+    print(f"  P-value : {p_value}")
+    print(f"  Valeurs critiques : {critical_values}")
+    if p_value < 0.05:
+        print("  Résultat : Série probablement non-stationnaire.")
+    else:
+        print("  Résultat : Série probablement stationnaire.")
+
+def testADF(ticker):
+    df = df_returns[ticker].dropna()
+    result = adfuller(df)
+    print(f"ADF pour {ticker} :")
+    print(f"  Statistique : {result[0]}")
+    print(f"  P-value : {result[1]}")
+    print(f"  Valeurs critiques : {result[4]}")
+    if result[1] < 0.05:
+        print("  Résultat : Série probablement stationnaire.")
+    else:
+        print("  Résultat : Série probablement non-stationnaire.")
+
+def testHomoscedascity():
+    for ticker in tickers_titres.keys():
+        print(f"\nTests pour {ticker} :")
+        testKPSS(ticker)
+        testADF(ticker)
+
+# Lancement des tests de stationnarité
+testHomoscedascity()
+
+# === Affichage du ratio de Sharpe optimal en fin de script ===
+print("\n=== FIN DU SCRIPT ===")
+print(f"Le ratio de Sharpe optimal est : {optimal_sharpe_ratio}")
+
