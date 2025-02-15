@@ -1,162 +1,139 @@
+# Importation des bibliothèques nécessaires
 import yfinance as yf
-import matplotlib.pyplot as plt
-import pandas as pd
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 from scipy.optimize import minimize
-from tabulate import tabulate
-from statsmodels.tsa.stattools import adfuller, kpss
-
-# Import de PCA (Analyse en Composantes Principales)
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-
-def pprint(df):
-    print(tabulate(df, headers='keys', tablefmt='psql'))
 
 # Définition des tickers et des noms des entreprises
 tickers_titres = {
-    "AC.PA": "Air Liquide",
+    "AC.PA": "Accor",
+    "AI.PA": "Airbus",
+    "AIR.PA": "Air Liquide",
+    "ORA.PA": "Orange",
+    "ENGI.PA": "Engie",
+    "SGO.PA": "Saint-Gobain",
+    "VIE.PA": "Veolia",
+    "BNP.PA": "BNP Paribas",
+    "DG.PA": "Dassault Systèmes",
+    "DSY.PA": "Dassault Aviation",
+    "CA.PA": "Crédit Agricole",
+    "BN.PA": "Danone",
     "MC.PA": "LVMH",
     "SAN.PA": "Sanofi",
-    "CS.PA": "Axa",
-    "OR.PA": "L'Oréal",
-    "EL.PA": "Essilor Luxotica",
-    "VIE.PA": "Veolia Environnement",
-    "ORA.PA": "Orange",
+    "SU.PA": "Schneider Electric",
+    "TTE.PA": "TotalEnergies",
     "VIV.PA": "Vivendi",
-    "SAF.PA": "Safran",
-    "^TYX": "US 30 Year T-Bond"
+    "^TYX": "US 30 Year T-Bond",
+    "CAC.PA": "Amundi CAC 40 ETF"  # Benchmark
 }
 
-# Récupération des données boursières
-tickers = tuple(tickers_titres.keys())
-df_all = yf.download(tickers, start="2014-01-01", end="2016-12-31")
+tickers = list(tickers_titres.keys())
 
-# Extraction des cours de clôture journaliers
-df_close = df_all["Close"]
+# Définition de la période d'analyse
+start_date = "2014-01-01"
+end_date = "2016-12-31"
 
-# Calcul des rendements
-df_returns = df_close.pct_change().dropna()
+# Téléchargement des données de marché via Yahoo Finance
+df_all = yf.download(tickers, start=start_date, end=end_date)["Close"].dropna()
 
-# Calcul de la Matrice de Covariance et Annualisation
-n_days = 252  # Nombre de jours de trading par an
-mean_returns = df_returns.mean() * n_days  # Rendements moyens annualisés
-cov_matrix = df_returns.cov() * n_days  # Matrice de covariance annualisée
+# Séparation des données du benchmark et des actifs du portefeuille
+df_benchmark = df_all["CAC.PA"]
+df_portfolio = df_all.drop(columns=["CAC.PA"])
 
-# Fonction pour minimiser le ratio de Sharpe négatif
-def negative_sharpe_ratio(weights, mean_returns, cov_matrix, risk_free_rate):
-    portfolio_return = np.dot(weights, mean_returns)  # Rendement du portefeuille
-    portfolio_volatility = np.sqrt(weights.T @ cov_matrix @ weights)  # Volatilité du portefeuille
-    sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
-    return -sharpe_ratio  # On minimise le Sharpe négatif
+# Calcul des rendements journaliers
+returns_benchmark = df_benchmark.pct_change().dropna()
+returns_portfolio = df_portfolio.pct_change().dropna()
 
-# Paramètres de l'optimisation
-num_assets = len(mean_returns)
-risk_free_rate = 0.02
-initial_weights = np.ones(num_assets) / num_assets  # Poids égaux au départ
+# Alignement des dates
+returns_benchmark = returns_benchmark.loc[returns_portfolio.index]
 
-# Contraintes : la somme des poids doit être égale à 1
-constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
+# Calcul des statistiques nécessaires
+n_days = 252  # Nombre de jours boursiers par an
+mean_returns = returns_portfolio.mean() * n_days           # Rendements annualisés des actifs
+cov_matrix = returns_portfolio.cov() * n_days                # Matrice de covariance annualisée
+mean_benchmark = returns_benchmark.mean() * n_days           # Rendement annualisé du benchmark
 
-# Bornes : chaque poids doit être compris entre 1% et 40%
-bounds = tuple((0.01, 0.4) for _ in range(num_assets))
+# Taux sans risque estimé via la moyenne de TYX
+risk_free_rate = df_all["^TYX"].mean() / 100
 
-# Optimisation avec la minimisation du ratio de Sharpe négatif
-optimized_result = minimize(
-    negative_sharpe_ratio,
-    initial_weights,
-    args=(mean_returns, cov_matrix, risk_free_rate),
-    method='SLSQP',
-    bounds=bounds,
-    constraints=constraints
-)
+# Fonction de minimisation du Sharpe Ratio négatif
+def negative_sharpe_ratio(weights, mean_returns, cov_matrix, rf):
+    portfolio_return = np.dot(weights, mean_returns)
+    portfolio_volatility = np.sqrt(weights.T @ cov_matrix @ weights)
+    sharpe_ratio = (portfolio_return - rf) / portfolio_volatility
+    return -sharpe_ratio
 
-# Résultat de l'optimisation
-optimal_weights = optimized_result.x
-optimal_sharpe_ratio = -optimized_result.fun
+# Fonction de calcul des contributions au risque (ERC)
+def risk_contribution(weights, cov_matrix):
+    port_volatility = np.sqrt(weights.T @ cov_matrix @ weights)
+    marginal_contribution = (cov_matrix @ weights) / port_volatility
+    risk_contributions = weights * marginal_contribution
+    return risk_contributions
 
-# === Affichage des résultats de l'optimisation ===
-print("\nRatio de Sharpe optimal :", optimal_sharpe_ratio)
-print("\nPoids optimaux du portefeuille :")
-for ticker, weight in zip(tickers, optimal_weights):
-    print(f"{ticker}: {weight:.2%}")
+# Fonction d'objectif ERC (minimisation de l'écart des contributions au risque)
+def diversification_objective(weights, cov_matrix):
+    risk_contributions = risk_contribution(weights, cov_matrix)
+    return np.std(risk_contributions)
 
-# === Visualisation des poids optimaux sous forme d'histogramme ===
+# Fonction objective combinée avec pénalité lambda
+def combined_objective(weights, mean_returns, cov_matrix, rf, lam):
+    return negative_sharpe_ratio(weights, mean_returns, cov_matrix, rf) + lam * diversification_objective(weights, cov_matrix)
+
+# Contraintes : somme des poids = 1 et borne inférieure à 1% pour chaque actif
+constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
+bounds = [(0.01, None) for _ in range(len(mean_returns))]
+
+# Initialisation des poids (équipondérés)
+initial_weights = np.ones(len(mean_returns)) / len(mean_returns)
+
+# Recherche de la meilleure valeur de lambda via une recherche par grille backsetting
+lambdas = np.linspace(0, 1, 21)  # Teste lambda de 0 à 1 par pas de 0.05
+best_lambda = None
+best_IR = -np.inf
+best_weights = None
+best_sharpe = None
+
+for lam in lambdas:
+    res = minimize(
+        combined_objective,
+        initial_weights,
+        args=(mean_returns, cov_matrix, risk_free_rate, lam),
+        method='SLSQP',
+        bounds=bounds,
+        constraints=constraints
+    )
+    if res.success:
+        w_opt = res.x
+        # Calcul du Sharpe Ratio et rendement du portefeuille
+        sharpe_val = -negative_sharpe_ratio(w_opt, mean_returns, cov_matrix, risk_free_rate)
+        port_return = np.dot(w_opt, mean_returns)
+        # Calcul de la Tracking Error
+        tracking_error = np.sqrt(np.mean((returns_portfolio @ w_opt - returns_benchmark) ** 2)) * np.sqrt(n_days)
+        IR_val = (port_return - mean_benchmark) / tracking_error
+        # Choisir le lambda qui maximise l'Information Ratio
+        if IR_val > best_IR:
+            best_IR = IR_val
+            best_lambda = lam
+            best_weights = w_opt
+            best_sharpe = sharpe_val
+
+print(f"Meilleur lambda : {best_lambda:.2f}")
+print(f"Ratio de Sharpe optimal : {best_sharpe:.4f}")
+print(f"Information Ratio (IR) : {best_IR:.4f}")
+
+# Affichage des poids optimaux sous forme d'histogramme
 plt.figure(figsize=(10, 5))
-plt.bar(tickers, optimal_weights * 100, color='royalblue')
+plt.bar([tickers_titres[t] for t in df_portfolio.columns], best_weights, color='skyblue')
 plt.xlabel("Actifs")
-plt.ylabel("Poids optimal (%)")
-plt.title("Répartition des poids du portefeuille optimisé")
-plt.xticks(rotation=45)
+plt.ylabel("Poids optimal")
+plt.title(f"Répartition des poids (ERC + Sharpe, \( w_i \geq 1\% \)) - λ = {best_lambda:.2f}")
+plt.xticks(rotation=45, ha='right')
+plt.grid(axis='y', linestyle='--', alpha=0.7)
 plt.tight_layout()
 plt.show()
 
-# === Ajout de l'Analyse en Composantes Principales (ACP) ===
-# 1. On standardise les rendements pour une ACP cohérente (optionnel mais conseillé)
-X = df_returns.dropna()
-X_scaled = StandardScaler().fit_transform(X)
 
-# 2. On applique la PCA
-pca = PCA()
-pca.fit(X_scaled)
-
-# 3. Variance expliquée par chaque composante
-explained_var = pca.explained_variance_ratio_
-components = np.arange(1, len(explained_var) + 1)
-
-plt.figure(figsize=(8, 4))
-plt.bar(components, explained_var * 100, color='skyblue')
-plt.xlabel("Composantes principales")
-plt.ylabel("Variance expliquée (%)")
-plt.title("Variance expliquée par les Composantes Principales (ACP)")
-plt.xticks(components)
-plt.tight_layout()
-plt.show()
-
-# Contributions de chaque actif dans la 1ère composante
-first_component_loadings = pca.components_[0]
-plt.figure(figsize=(10, 5))
-plt.bar(tickers, first_component_loadings, color='orange')
-plt.xlabel("Actifs")
-plt.ylabel("Poids dans la 1ère composante")
-plt.title("Contributions des actifs dans la 1ère composante principale")
-plt.xticks(rotation=45)
-plt.tight_layout()
-plt.show()
-
-# === Tests de séries temporelles (KPSS et ADF) ===
-def testKPSS(ticker):
-    df = df_returns[ticker].dropna()
-    kpss_stat, p_value, lags, critical_values = kpss(df, regression='c')
-    print(f"KPSS pour {ticker} :")
-    print(f"  Statistique : {kpss_stat}")
-    print(f"  P-value : {p_value}")
-    print(f"  Valeurs critiques : {critical_values}")
-    if p_value < 0.05:
-        print("  Résultat : Série probablement non-stationnaire.")
-    else:
-        print("  Résultat : Série probablement stationnaire.")
-
-def testADF(ticker):
-    df = df_returns[ticker].dropna()
-    result = adfuller(df)
-    print(f"ADF pour {ticker} :")
-    print(f"  Statistique : {result[0]}")
-    print(f"  P-value : {result[1]}")
-    print(f"  Valeurs critiques : {result[4]}")
-    if result[1] < 0.05:
-        print("  Résultat : Série probablement stationnaire.")
-    else:
-        print("  Résultat : Série probablement non-stationnaire.")
-
-def testHomoscedascity():
-    for ticker in tickers_titres.keys():
-        print(f"\nTests pour {ticker} :")
-        testKPSS(ticker)
-        testADF(ticker)
-
-# Lancement des tests de stationnarité
-testHomoscedascity()
 
 # === Affichage du ratio de Sharpe optimal en fin de script ===
 print("\n=== FIN DU SCRIPT ===")
