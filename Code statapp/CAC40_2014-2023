@@ -1,0 +1,31 @@
+import yfinance as yf
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# Définition du ticker du CAC 40
+ticker = "^FCHI"
+
+# Définition des périodes de 3 ans à comparer
+periods = [
+    ("2014-01-01", "2016-12-31"),
+    ("2017-01-01", "2019-12-31"),
+    ("2020-01-01", "2022-12-31")
+]
+
+# Récupération des données pour chaque période
+data = {}
+for start, end in periods:
+    data[start] = yf.download(ticker, start=start, end=end)["Close"]
+
+# Tracé des courbes avec affichage point par point
+plt.figure(figsize=(12, 6))
+
+for i, (start, end) in enumerate(periods):
+    plt.plot(data[start].index, data[start].values, linestyle='-', marker='.', markersize=2, label=f"Période {start[:4]}-{end[:4]} (points = valeurs journalières)")
+
+plt.xlabel("Date")
+plt.ylabel("Cours de clôture du CAC 40")
+plt.title("Évolution journalière du CAC 40 sur différentes périodes de 3 ans")
+plt.legend()
+plt.grid(True)
+plt.show()
