@@ -1,34 +1,23 @@
-import yfinance as yf
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
-# Définition de la période d'analyse
-start_date = "2014-01-01"
-end_date = "2016-12-31"
+#Récupération du cours de clotûre quotidien du T-Bond sur la période
+df_portfolio_1 = pd.read_csv("./Df_portfolio_1")
+tyx_data=df_portfolio_1["^TYX"]
 
-# Téléchargement des données du rendement du T-Bond 30 ans (^TYX) via Yahoo Finance
-tyx_data = yf.download("^TYX", start=start_date, end=end_date)["Close"]
+# Estimation du taux sans risque moyen par moyenne empirique
+r_f = np.mean(tyx_data) / 100  # Conversion en taux décimal
 
-# Vérification si les données sont bien téléchargées
-if tyx_data.empty:
-    print("Aucune donnée récupérée. Vérifie la connexion à Yahoo Finance.")
-else:
-    # Calcul des rendements journaliers
-    tyx_returns = tyx_data.pct_change().dropna()
+# Affichage des résultats
+print(f"Taux sans risque estimé (2014-2016) : {r_f:.4%}")
 
-    # Estimation du taux sans risque moyen par moyenne empirique
-    r_f = np.mean(tyx_data) / 100  # Conversion en taux décimal
-
-    # Affichage des résultats
-    print(f"Taux sans risque estimé (2014-2016) : {r_f:.4%}")
-
-    # affichage du graphique des taux TYX
-    import matplotlib.pyplot as plt
-    plt.figure(figsize=(10,5))
-    plt.plot(tyx_data, label="Taux du T-Bond 30 ans (^TYX)", color="blue")
-    plt.xlabel("Date")
-    plt.ylabel("Taux (%)")
-    plt.title("Évolution du rendement du T-Bond 30 ans (2014-2016)")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+# affichage du graphique des taux TYX
+plt.figure(figsize=(10,5))
+plt.plot(tyx_data, label="Taux du T-Bond 30 ans (^TYX)", color="blue")
+plt.xlabel("Date")
+plt.ylabel("Taux (%)")
+plt.title("Évolution du rendement du T-Bond 30 ans (2014-2016)")
+plt.legend()
+plt.grid(True)
+plt.show()
