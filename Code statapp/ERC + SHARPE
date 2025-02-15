@@ -135,7 +135,7 @@ plt.show()
 
 
 
-# === Affichage du ratio de Sharpe optimal en fin de script ===
+#Affichage de Sharpe
 print("\n=== FIN DU SCRIPT ===")
 print(f"Le ratio de Sharpe optimal est : {optimal_sharpe_ratio}")
 
