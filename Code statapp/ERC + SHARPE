@@ -127,15 +127,11 @@ plt.figure(figsize=(10, 5))
 plt.bar([tickers_titres[t] for t in df_portfolio.columns], best_weights, color='skyblue')
 plt.xlabel("Actifs")
 plt.ylabel("Poids optimal")
-plt.title(f"Répartition des poids (ERC + Sharpe, \( w_i \geq 1\% \)) - λ = {best_lambda:.2f}")
+plt.title(f"Répartition des poids ERC + Sharpe  λ = {best_lambda:.2f}")
 plt.xticks(rotation=45, ha='right')
 plt.grid(axis='y', linestyle='--', alpha=0.7)
 plt.tight_layout()
 plt.show()
 
 
-
-#Affichage de Sharpe
-print("\n=== FIN DU SCRIPT ===")
-print(f"Le ratio de Sharpe optimal est : {optimal_sharpe_ratio}")
 
