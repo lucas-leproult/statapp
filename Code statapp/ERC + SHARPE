@@ -1,11 +1,10 @@
-# Importation des bibliothèques nécessaires
 import yfinance as yf
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 
-# Définition des tickers et des noms des entreprises
+# Définition des tickers et des noms des entreprises (Remplacement des Dassaults)
 tickers_titres = {
     "AC.PA": "Accor",
     "AI.PA": "Airbus",
@@ -15,8 +14,8 @@ tickers_titres = {
     "SGO.PA": "Saint-Gobain",
     "VIE.PA": "Veolia",
     "BNP.PA": "BNP Paribas",
-    "DG.PA": "Dassault Systèmes",
-    "DSY.PA": "Dassault Aviation",
+    "CAP.PA": "Capgemini",   # Remplace Dassault Systèmes
+    "SAF.PA": "Safran",      # Remplace Dassault Aviation
     "CA.PA": "Crédit Agricole",
     "BN.PA": "Danone",
     "MC.PA": "LVMH",
@@ -51,8 +50,8 @@ returns_benchmark = returns_benchmark.loc[returns_portfolio.index]
 # Calcul des statistiques nécessaires
 n_days = 252  # Nombre de jours boursiers par an
 mean_returns = returns_portfolio.mean() * n_days           # Rendements annualisés des actifs
-cov_matrix = returns_portfolio.cov() * n_days                # Matrice de covariance annualisée
-mean_benchmark = returns_benchmark.mean() * n_days           # Rendement annualisé du benchmark
+cov_matrix = returns_portfolio.cov() * n_days             # Matrice de covariance annualisée
+mean_benchmark = returns_benchmark.mean() * n_days        # Rendement annualisé du benchmark
 
 # Taux sans risque estimé via la moyenne de TYX
 risk_free_rate = df_all["^TYX"].mean() / 100
@@ -87,7 +86,7 @@ bounds = [(0.01, None) for _ in range(len(mean_returns))]
 # Initialisation des poids (équipondérés)
 initial_weights = np.ones(len(mean_returns)) / len(mean_returns)
 
-# Recherche de la meilleure valeur de lambda via une recherche par grille backsetting
+# Recherche de la meilleure valeur de lambda via une recherche par grille (backsetting)
 lambdas = np.linspace(0, 1, 21)  # Teste lambda de 0 à 1 par pas de 0.05
 best_lambda = None
 best_IR = -np.inf
@@ -131,6 +130,8 @@ plt.title(f"Répartition des poids ERC + Sharpe  λ = {best_lambda:.2f}")
 plt.xticks(rotation=45, ha='right')
 plt.grid(axis='y', linestyle='--', alpha=0.7)
 plt.tight_layout()
+plt.show()
+
 plt.show()
 
 
