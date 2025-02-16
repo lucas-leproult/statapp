@@ -1,0 +1,99 @@
+import yfinance as yf
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+from sklearn.decomposition import PCA
+import seaborn as sns
+
+tickers_titres = {
+    "AC.PA": "Accor",
+    "AI.PA": "Airbus",
+    "AIR.PA": "Air Liquide",
+    "ORA.PA": "Orange",
+    "ENGI.PA": "Engie",
+    "SGO.PA": "Saint-Gobain",
+    "VIE.PA": "Veolia",
+    "BNP.PA": "BNP Paribas",
+    "CAP.PA": "Capgemini",
+    "SAF.PA": "Safran",
+    "CA.PA": "Crédit Agricole",
+    "BN.PA": "Danone",
+    "MC.PA": "LVMH",
+    "SAN.PA": "Sanofi",
+    "SU.PA": "Schneider Electric",
+    "TTE.PA": "TotalEnergies",
+    "VIV.PA": "Vivendi",
+    "^TYX": "US 30 Year T-Bond",
+    "CAC.PA": "Amundi CAC 40 ETF"  # Benchmark
+}
+tickers = list(tickers_titres.keys())
+
+start_date = "2014-01-01"
+end_date   = "2016-12-31"
+
+# Téléchargement des données
+df_all = yf.download(tickers, start=start_date, end=end_date)["Close"].dropna()
+df_benchmark = df_all["CAC.PA"]
+df_portfolio = df_all.drop(columns=["CAC.PA"])
+
+# Rendements journaliers
+returns_benchmark = df_benchmark.pct_change().dropna()
+returns_portfolio = df_portfolio.pct_change().dropna()
+returns_benchmark = returns_benchmark.loc[returns_portfolio.index]
+
+#ACP 
+pca = PCA()
+pca.fit(returns_portfolio)
+
+# Variance expliquée par composante
+explained_variance = pca.explained_variance_ratio_
+cumulative_variance = np.cumsum(explained_variance)
+
+# Nombre optimal de composantes (seuil de 90%)
+threshold = 0.90
+K_auto = np.argmax(cumulative_variance >= threshold) + 1
+print(f"Nombre de composantes retenues : {K_auto}")
+
+# Charges factorielles (loadings)
+loadings = pd.DataFrame(pca.components_.T, 
+                        index=returns_portfolio.columns, 
+                        columns=[f"PC{i+1}" for i in range(len(pca.components_))])
+
+# Exporter les charges factorielles dans un fichier CSV
+loadings.to_csv("charges_factorielles.csv", index=True)
+print("Les charges factorielles ont été exportées dans 'charges_factorielles.csv'.")
+
+# Vérification 1 : Corrélation PC1 / Benchmark 
+PC1 = returns_portfolio @ pca.components_[0]  # Projection des rendements sur PC1
+corr_pc1_benchmark = np.corrcoef(PC1, returns_benchmark)[0, 1]
+print(f"Corrélation entre PC1 et le benchmark (CAC 40) : {corr_pc1_benchmark:.4f}")
+
+#  Vérification 2 : Structure des charges factorielles 
+plt.figure(figsize=(10,5))
+sns.barplot(x=loadings.index, y=loadings["PC1"], color="blue", alpha=0.6)
+plt.axhline(0, color='black', linewidth=0.8, linestyle="--")
+plt.xticks(rotation=45, ha='right')
+plt.xlabel("Actifs")
+plt.ylabel("Charge factorielle sur PC1")
+plt.title("Structure des charges factorielles (PC1)")
+plt.show()
+
+#  Analyse des PC2 et PC3 
+plt.figure(figsize=(10,5))
+sns.barplot(x=loadings.index, y=loadings["PC2"], color="red", alpha=0.6)
+plt.axhline(0, color='black', linewidth=0.8, linestyle="--")
+plt.xticks(rotation=45, ha='right')
+plt.xlabel("Actifs")
+plt.ylabel("Charge factorielle sur PC2")
+plt.title("Structure des charges factorielles (PC2)")
+plt.show()
+
+plt.figure(figsize=(10,5))
+sns.barplot(x=loadings.index, y=loadings["PC3"], color="green", alpha=0.6)
+plt.axhline(0, color='black', linewidth=0.8, linestyle="--")
+plt.xticks(rotation=45, ha='right')
+plt.xlabel("Actifs")
+plt.ylabel("Charge factorielle sur PC3")
+plt.title("Structure des charges factorielles (PC3)")
+plt.show()
