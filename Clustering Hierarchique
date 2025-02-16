@@ -1,0 +1,60 @@
+import yfinance as yf
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.cluster.hierarchy import dendrogram, linkage
+from scipy.spatial.distance import squareform
+
+tickers_titres = {
+    "AC.PA": "Accor",
+    "AI.PA": "Airbus",
+    "AIR.PA": "Air Liquide",
+    "ORA.PA": "Orange",
+    "ENGI.PA": "Engie",
+    "SGO.PA": "Saint-Gobain",
+    "VIE.PA": "Veolia",
+    "BNP.PA": "BNP Paribas",
+    "CAP.PA": "Capgemini",
+    "SAF.PA": "Safran",
+    "CA.PA": "Crédit Agricole",
+    "BN.PA": "Danone",
+    "MC.PA": "LVMH",
+    "SAN.PA": "Sanofi",
+    "SU.PA": "Schneider Electric",
+    "TTE.PA": "TotalEnergies",
+    "VIV.PA": "Vivendi",
+    "^TYX": "US 30 Year T-Bond"
+}
+
+# Pour le clustering, nous utilisons uniquement les actifs boursiers
+equity_tickers = [t for t in tickers_titres.keys() if t != "^TYX"]
+
+start_date = "2014-01-01"
+end_date = "2016-12-31"
+
+# Téléchargement des données de clôture pour les actifs
+df = yf.download(equity_tickers, start=start_date, end=end_date)["Close"].dropna()
+
+# Calcul des rendements journaliers
+returns = df.pct_change().dropna()
+
+# Calcul de la matrice de corrélation
+corr_matrix = returns.corr()
+
+# Construction de la matrice de distance
+# La distance est définie par : d(i, j) = sqrt(2(1 - ρ(r_i, r_j)))
+distance_matrix = np.sqrt(2 * (1 - corr_matrix))
+
+# Conversion de la matrice de distance en format condensé (requis par la fonction linkage)
+condensed_distance = squareform(distance_matrix, checks=False)
+
+# Application du clustering hiérarchique avec le linkage de Ward
+Z = linkage(condensed_distance, method='ward')
+
+# Affichage du dendrogramme
+plt.figure(figsize=(12, 6))
+dendrogram(Z, labels=[tickers_titres[t] for t in equity_tickers], leaf_rotation=90)
+plt.title("Dendrogramme - Clustering hiérarchique (Linkage de Ward)")
+plt.xlabel("Actifs")
+plt.ylabel("Distance")
+plt.show()
