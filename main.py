@@ -441,14 +441,14 @@ def plotEfficientFrontier(tickersReturns, n_portfolios=5000):
 
     for i in range(n_portfolios):
         weights = np.random.dirichlet(np.ones(len(tickers)), size=1).flatten()
-        weights_dict = {tickers[k]: weights[k] for k in range(len(tickers))}
+        weightsDict = {tickers[k]: weights[k] for k in range(len(tickers))}
 
-        portfolio_return = portfolioReturns(weights_dict, tickersReturns).mean() * 252  # Annualized
-        portfolio_volatility = math.sqrt(computeWeightedVar(covMat, weights_dict) * 252)  # Annualized
+        portfolioReturn = portfolioReturns(weightsDict, tickersReturns).mean() * 252  # Annualized
+        portfolioVolatility = math.sqrt(computeWeightedVar(covMat, weightsDict) * 252)  # Annualized
 
-        results[0, i] = portfolio_return
-        results[1, i] = portfolio_volatility
-        results[2, i] = computeSharpeRatio(portfolioReturns(weights_dict, tickersReturns))
+        results[0, i] = portfolioReturn
+        results[1, i] = portfolioVolatility
+        results[2, i] = computeSharpeRatio(portfolioReturns(weightsDict, tickersReturns))
 
     plt.figure(figsize=(10, 6))
     plt.scatter(results[1], results[0], c=results[2], cmap='viridis', alpha=0.5)
@@ -457,6 +457,9 @@ def plotEfficientFrontier(tickersReturns, n_portfolios=5000):
     plt.ylabel("Expected Return")
     plt.title("Efficient Frontier (Monte Carlo Simulation)")
     plt.grid(True)
+    plt.axis([0.09, 0.25, 0.07, 0.22])
     plt.show()
 
-plotEfficientFrontier(returns, 50000)
+plotEfficientFrontier(returns, 500000)
+portfolio = portfolioReturns(optiWeights, returns)
+print(computeSharpeRatio(portfolio))
