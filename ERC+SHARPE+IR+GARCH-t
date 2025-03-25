@@ -14,6 +14,10 @@ from scipy.stats import anderson
 import statsmodels.api as sm
 from arch import arch_model
 import scipy.optimize as sco
+from xgboost import XGBRegressor
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error
+from sklearn.covariance import LedoitWolf
 
 # Définition du chemin du dossier contenant les fichiers CSV
 data_path = "C:/Users/franc/Downloads/ENSAE/Stat_app_données/"
@@ -536,9 +540,25 @@ for i in vol_mixte_annualized.keys():
 # Conversion en type float par sécurité
 cov_matrix_mixte = cov_matrix_mixte.astype(float)
 
+
+
 #Affichage de la matrice de covariance mixte annualisée
+#verification de la cohérence de la matrice
 print("Matrice de covariance mixte annualisée :")
 print(cov_matrix_mixte)
+print("Test de Symétrie de la matrice de covariance mixte")
+print(np.allclose(cov_matrix_mixte, cov_matrix_mixte .T, atol=1e-8))
+print("Test de Positivité")
+def is_positive_semidefinite(matrix, atol=1e-10):
+    if not np.allclose(matrix, matrix.T, atol=atol):
+        return False  # pas symétrique
+    eigvals = np.linalg.eigvals(matrix)
+    return np.all(eigvals > -atol)
+print(is_positive_semidefinite(cov_matrix_mixte,1e-10))
+
+#Les tests renvoient TRUE donc on a bien une matrice de covariance
+#cohérente
+
 # -------------------------------------------------------------------
 # 4. Optimisation du portefeuille avec Sharpe et ERC
 # -------------------------------------------------------------------
@@ -733,7 +753,6 @@ plt.show()
 # -------------------------------------------------------------------
 # 6. Frontière efficiente
 # -------------------------------------------------------------------
-
 def efficient_frontier_with_portfolios(cov_matrix, returns, rf, returns_portfolio, returns_bench,
                                        n_days, mean_bench, combined_objective, negative_sharpe_ratio, downside,
                                        lambda_grid=None, num_portfolios=100):
@@ -800,13 +819,19 @@ def efficient_frontier_with_portfolios(cov_matrix, returns, rf, returns_portfoli
             y_cml = rf + slope * x_cml
             plt.plot(x_cml, y_cml, 'k--', label='Capital Market Line')
 
-        # d) Mise en forme du graphe
+    # Limites des axes
+    plt.xlim(0, 0.3)
+    plt.ylim(0, 0.4)
+
     plt.xlabel('Risque (Écart-type)')
     plt.ylabel('Rendement attendu')
     plt.title('Frontière efficiente et Capital Market Line')
     plt.legend()
     plt.grid()
     plt.show()
+
+
+#Essayer d'améliorer le plot pas ouf et interprétations à venir...
 
 efficient_frontier_with_portfolios(
     cov_matrix=Cov_matrix,
@@ -831,3 +856,295 @@ efficient_frontier_with_portfolios(
     combined_objective=combined_objective,
     negative_sharpe_ratio=negative_sharpe_ratio,
     downside=downside)
+
+#On peut se dire qu'une évolution du Sharpe qui est désormais de 1.43 environ
+#Serait une bonne chose. Cependant, un piège classique est celui de l'in Sample Vs out sample
+#Et notre stratégie n'est vraiment pas bonne out of sample
+#On va donc tester une autre approche, plus robuste out of sample
+#Mais sans doute moins performante In-sample
+
+#On va utiliser une approche ML+Black Litterman (BL) on va définir plusieurs
+#Features pour nos vues
+
+#RSI
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+
+    roll_up = up.rolling(period).mean()
+    roll_down = down.rolling(period).mean()
+
+    rs = roll_up / roll_down
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+#MACD
+def compute_macd(series: pd.Series, span_short=12, span_long=26, span_signal=9):
+    ema_short = series.ewm(span=span_short, adjust=False).mean()
+    ema_long = series.ewm(span=span_long, adjust=False).mean()
+    macd = ema_short - ema_long
+    signal = macd.ewm(span=span_signal, adjust=False).mean()
+    return macd, signal
+
+#Momentum
+def compute_momentum(series: pd.Series, period:int=5) -> pd.Series:
+    return series.diff(period)
+
+#Rolling std
+def compute_rolling_std(series: pd.Series, window:int=10) -> pd.Series:
+    return series.rolling(window).std()
+
+#Rendements passés
+def lag_series(series: pd.Series, lag=1) -> pd.Series:
+    return series.shift(lag)
+
+#On crée une DF de features pour chaque actif
+
+def build_features_for_asset(returns: pd.Series) -> pd.DataFrame:
+
+    df = pd.DataFrame({'ret': returns})
+
+    # RSI (14)
+    df['rsi_14'] = compute_rsi(returns, 14)
+
+    # MACD
+    macd_line, macd_signal = compute_macd(returns, 12, 26, 9)
+    df['macd'] = macd_line
+    df['macd_signal'] = macd_signal
+
+    # momentum 5
+    df['mom_5'] = compute_momentum(returns, 5)
+
+    # rolling std 10
+    df['std_10'] = compute_rolling_std(returns, 10)
+
+    # lags
+    df['lag1'] = lag_series(returns, 1)
+    df['lag2'] = lag_series(returns, 2)
+
+    # On pourrait ajouter plus d'indicateurs
+    # ex: Bollinger, ... à voir
+
+    df.dropna(inplace=True)
+    return df
+
+
+#Cross val + XGBoost
+def train_and_cv_xgb(features_df: pd.DataFrame, n_splits=3):
+
+    # On veut prédire ret[t+1], donc shift(-1)
+    # => On retire la dernière ligne, ou on aligne
+    df = features_df.copy()
+    df['y'] = df['ret'].shift(-1)
+    df.dropna(inplace=True)  # retire le dernier point en trop ou tout NaN
+
+    if len(df) < 30:
+        # trop peu de data
+        return None, 0.01, np.nan
+
+    X = df.drop(columns=['ret', 'y'])
+    y = df['y']
+
+    # time series splits
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
+    all_errors = []
+    # On va stocker un model final
+    final_model = XGBRegressor(
+        n_estimators=30, max_depth=2, learning_rate=0.1,
+        subsample=0.8, colsample_bytree=0.8, random_state=42
+    )
+
+    for train_index, val_index in tscv.split(X):
+        X_train, X_val = X.iloc[train_index], X.iloc[val_index]
+        y_train, y_val = y.iloc[train_index], y.iloc[val_index]
+
+        final_model.fit(
+            X_train,
+            y_train,
+            # eval_set=[(X_val, y_val)],
+            verbose=False
+        )
+        preds_val = final_model.predict(X_val)
+        mse_val = mean_squared_error(y_val, preds_val)
+        all_errors.append(mse_val)
+
+    # MSE moyenne
+    mse_mean = np.mean(all_errors)
+
+    # On refit sur l'ensemble
+    final_model.fit(X, y, verbose=False)
+
+    # On prédit sur le DERNIER point (on veut la vue)
+    # le dernier point du DF
+    last_row = X.iloc[[-1]]
+    pred_last = final_model.predict(last_row)[0]
+
+    return final_model, mse_mean, pred_last
+
+def black_litterman_posterior(
+    cov_matrix: np.ndarray,
+    market_weights: np.ndarray,
+    risk_aversion: float,
+    Q: np.ndarray,
+    tau: float,
+    Omega: np.ndarray
+):
+    # 1) pi = risk_aversion * cov_matrix @ market_weights
+    pi = risk_aversion * cov_matrix @ market_weights
+
+    # 2) On suppose P=I => vues absolues
+    n = len(market_weights)
+    P = np.eye(n)
+
+    # 3) Inversions
+    inv_tauC = np.linalg.inv(tau * cov_matrix)
+    inv_Omega = np.linalg.inv(Omega)
+    middle = inv_tauC + P.T @ inv_Omega @ P
+    middle_inv = np.linalg.inv(middle)
+
+    right = inv_tauC @ pi + P.T @ inv_Omega @ Q
+    mu_post = middle_inv @ right
+
+    return mu_post
+
+
+def rolling_backtest_tech_xgb_bl(
+        returns_portfolio: pd.DataFrame,
+        returns_benchmark: pd.DataFrame,
+        window_size=252,
+        step_size=21,
+        rf_an=0.02,
+        risk_aversion=2.5,
+        optimize_portfolio_func=None,
+        negative_sharpe_ratio=None,
+        downside=None,
+        combined_objective=None,
+        lambda_grid=None,
+        bounds=None,
+        n_days=252
+):
+    assets = returns_portfolio.columns
+    n_assets = len(assets)
+    dates = returns_portfolio.index
+
+    # On suppose un marché 1/n
+    market_weights = np.ones(n_assets) / n_assets
+
+    results = []
+
+    for start in range(0, len(dates) - window_size - step_size, step_size):
+        in_idx = range(start, start + window_size)
+        out_idx = range(start + window_size, start + window_size + step_size)
+
+        in_sample_returns = returns_portfolio.iloc[in_idx]
+        out_sample_returns = returns_portfolio.iloc[out_idx]
+        in_sample_bench = returns_benchmark.iloc[in_idx]
+        out_sample_bench = returns_benchmark.iloc[out_idx]
+
+        # (A) Covariance via LedoitWolf
+        lw = LedoitWolf()
+        lw.fit(in_sample_returns.values)
+        cov_lw = lw.covariance_  # shape (n,n)
+
+        # Pour chaque actifs => features => XGB => MSE => final pred
+        Q_array = np.zeros(n_assets)
+        errors = []
+
+        for i, asset in enumerate(assets):
+            # Build features
+            feat_df = build_features_for_asset(in_sample_returns[asset])  # RSI, MACD, momentum, etc.
+            # On appelle ensuite train_and_cv_xgb
+            model, mse_mean, pred_last = train_and_cv_xgb(feat_df, n_splits=3)
+            Q_array[i] = pred_last
+            errors.append(mse_mean)
+
+        tau_est = np.mean(errors)
+        Omega = np.diag([tau_est] * n_assets)
+
+        # (C) Black-Litterman => mu_post
+        mu_post = black_litterman_posterior(
+            cov_matrix=cov_lw,
+            market_weights=market_weights,
+            risk_aversion=risk_aversion,
+            Q=Q_array,
+            tau=tau_est,
+            Omega=Omega
+        )
+
+        mu_post_series = pd.Series(mu_post, index=assets)
+        mean_bench_in = in_sample_bench.mean().iloc[0] * n_days
+
+        # (D) Optimisation ERC+Sharpe => weights
+        lam, weights_opt, IR_in, sharpe_in = optimize_portfolio_func(
+            mu_post_series,
+            pd.DataFrame(cov_lw, index=assets, columns=assets),
+            rf_an,
+            in_sample_returns,
+            in_sample_bench,
+            n_days,
+            mean_bench_in,
+            combined_objective,
+            negative_sharpe_ratio,
+            downside,
+            lambda_grid=lambda_grid,
+            bounds=bounds
+        )
+
+        # (E) Perf out-of-sample
+        pf_out = out_sample_returns @ weights_opt
+        mean_out = pf_out.mean() * n_days
+        std_out = pf_out.std() * np.sqrt(n_days)
+        sharpe_out = np.nan
+        if std_out > 1e-12:
+            sharpe_out = (mean_out - rf_an) / std_out
+
+        out_bench_vals = out_sample_bench.iloc[:, 0] if isinstance(out_sample_bench, pd.DataFrame) else out_sample_bench
+        mean_bench_out = out_bench_vals.mean() * n_days
+        tracking_error = (pf_out - out_bench_vals).std() * np.sqrt(n_days)
+        IR_out = np.nan
+        if tracking_error > 1e-12:
+            IR_out = (mean_out - mean_bench_out) / tracking_error
+
+        dt_test = dates[start + window_size]
+        results.append({
+            "Start": dt_test,
+            "Lambda": lam,
+            "Sharpe_Out": sharpe_out,
+            "IR_Out": IR_out,
+            "tau_est": tau_est
+        })
+
+    df_res = pd.DataFrame(results)
+    return df_res
+
+df_bt_ml_bl = rolling_backtest_tech_xgb_bl(
+    returns_portfolio=returns_portfolio_1,
+    returns_benchmark=returns_benchmark,
+    window_size=252,         # Environ 1 an
+    step_size=21,            # Environ 1 mois
+    rf_an=rf_an,             # taux sans risque annualisé estimé avec IRX
+    risk_aversion=2.5,       # Valeur classique dans la littérature
+    optimize_portfolio_func=optimize_portfolio_with_grid_search,
+    negative_sharpe_ratio=negative_sharpe_ratio,
+    downside=downside,
+    combined_objective=combined_objective,
+    lambda_grid=np.linspace(0, 1, 21),
+    bounds=[(0.01, 0.4)] * returns_portfolio_1.shape[1],
+    n_days=252
+)
+
+print(df_bt_ml_bl)
+print("Sharpe out-of-sample moyen :", df_bt_ml_bl["Sharpe_Out"].mean())
+print("IR out-of-sample moyen :", df_bt_ml_bl["IR_Out"].mean())
+
+plt.figure(figsize=(10, 5))
+plt.plot(df_bt_ml_bl["Start"], df_bt_ml_bl["Sharpe_Out"], label="Sharpe OOS")
+plt.plot(df_bt_ml_bl["Start"], df_bt_ml_bl["IR_Out"], label="IR OOS")
+plt.axhline(0, color='black', linestyle='--')
+plt.legend()
+plt.title("Stratégie ML + Black-Litterman + ERC+Sharpe")
+plt.xticks(rotation=45)
+plt.grid(True)
+plt.show()
