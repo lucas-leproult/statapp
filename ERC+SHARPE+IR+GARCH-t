@@ -29,6 +29,8 @@ returns_benchmark_file = os.path.join(data_path, "returns_benchmark.csv")
 returns_portfolio_file = os.path.join(data_path, "returns_portfolio_1.csv")
 irx_csv_file = os.path.join(data_path, "Df_irx.csv")
 
+
+
 if not all(os.path.exists(f) for f in [benchmark_file, portfolio_file, returns_benchmark_file, returns_portfolio_file, irx_csv_file]):
     raise FileNotFoundError("Un ou plusieurs fichiers CSV sont manquants. Assurez-vous d'avoir généré les données.")
 
@@ -618,6 +620,9 @@ print(f"Taux sans risque annualisé : {mean(S)*252 * 100:.6f}%")
 rf_annualized = (1 + S) ** 252  # On annualise chaque jour
 rf_an= rf_annualized.mean() - 1  # Puis on prend la moyenne
 
+#Pour la suite on calcule également une moyenne mobile pour le taux sans risque
+
+rf_series_rolling=irx_data.rolling(window=21).mean()
 #Evolution du T-BILL (^IRX) sur la période considérée
 plt.figure(figsize=(10, 5))
 plt.plot(irx_data.index, irx_data.values, label="Prix de clôture du T-Bill (^IRX)", color="blue")
@@ -653,7 +658,8 @@ def optimize_portfolio_with_grid_search(mean_returns, cov_matrix, rf,
                                         downside,
                                         lambda_grid=None,
                                         initial_weights=None,
-                                        bounds=None):
+                                        bounds=None,
+                                        ):
     # Valeurs par défaut pour la grille et l'initialisation
     if lambda_grid is None:
         lambda_grid = np.linspace(0, 1, 21)
@@ -879,6 +885,35 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
+#Rolling Sharpe (1 mois)
+def compute_rolling_sharpe(series: pd.Series, window: int = 21, rf_daily: float = 0.0001):
+    excess_ret = series - rf_daily
+    rolling_mean = excess_ret.rolling(window).mean()
+    rolling_std = excess_ret.rolling(window).std()
+    return rolling_mean / rolling_std
+
+#Alpha vs benchmark (1 mois)
+def compute_alpha(series: pd.Series, benchmark: pd.Series, window: int = 21):
+    return (series - benchmark).rolling(window).mean()
+
+#Beta vs bechmarck (21 jours)
+def compute_rolling_beta(asset: pd.Series, benchmark: pd.Series, window: int = 21):
+    cov = asset.rolling(window).cov(benchmark)
+    var = benchmark.rolling(window).var()
+    return cov / var
+
+#Momentum Zscore (5j)
+def compute_momentum_zscore(series: pd.Series, window: int = 5, z_window: int = 60):
+    mom = series.diff(window)
+    mean = mom.rolling(z_window).mean()
+    std = mom.rolling(z_window).std()
+    return (mom - mean) / std
+
+#Tracking Error
+def compute_tracking_error(series: pd.Series, benchmark: pd.Series, window: int = 21):
+    diff = series - benchmark
+    return diff.rolling(window).std()
+
 #MACD
 def compute_macd(series: pd.Series, span_short=12, span_long=26, span_signal=9):
     ema_short = series.ewm(span=span_short, adjust=False).mean()
@@ -899,9 +934,23 @@ def compute_rolling_std(series: pd.Series, window:int=10) -> pd.Series:
 def lag_series(series: pd.Series, lag=1) -> pd.Series:
     return series.shift(lag)
 
+
+#oscillateur stochastique
+def compute_stoch_oscillator(series: pd.Series, window=14, d_window=3):
+    rolling_min = series.rolling(window).min()
+    rolling_max = series.rolling(window).max()
+
+    stochK = 100 * (series - rolling_min) / (rolling_max - rolling_min)
+    stochD = stochK.rolling(d_window).mean()
+
+    return stochK, stochD
+
+
 #On crée une DF de features pour chaque actif
 
-def build_features_for_asset(returns: pd.Series) -> pd.DataFrame:
+#En gros dans cette fonction on va choisir tous les "critères"
+#sur lesquels ont va baser nos predictions (c'est des regresseurs en quelques sortes)
+def build_features_for_asset(returns: pd.Series, benchmark: pd.Series) -> pd.DataFrame:
 
     df = pd.DataFrame({'ret': returns})
 
@@ -919,69 +968,122 @@ def build_features_for_asset(returns: pd.Series) -> pd.DataFrame:
     # rolling std 10
     df['std_10'] = compute_rolling_std(returns, 10)
 
+    #vol EWMA met plus de poids sur les observations récentes
+
+    df['ewma_std_21']=returns.ewm(span=21).std()
+
     # lags
     df['lag1'] = lag_series(returns, 1)
     df['lag2'] = lag_series(returns, 2)
 
-    # On pourrait ajouter plus d'indicateurs
-    # ex: Bollinger, ... à voir
+    #Stock index
+    stochK, stochD = compute_stoch_oscillator(returns, window=14, d_window=3)
+    df['stochK_14'] = stochK
+    df['stochD_14'] = stochD
+
+    #Rolling Sharpe
+    df['sharpe_21'] = compute_rolling_sharpe(returns, window=21)
+
+    #Alpha
+    df['alpha_21'] = compute_alpha(returns,benchmark , window=21)
+
+    #Beta
+    #df['beta_21'] = compute_rolling_beta(returns,benchmark)
+
+    #Zscore
+    df['mom_zscore'] = compute_momentum_zscore(returns)
+
+    #Downside
+    df['down_vol_21'] = downside(returns)
+
+    #Tracking Error
+    #df['te_21'] = compute_tracking_error(returns,benchmark)
 
     df.dropna(inplace=True)
     return df
 
 
 #Cross val + XGBoost
-def train_and_cv_xgb(features_df: pd.DataFrame, n_splits=3):
+def train_and_cv_xgb_custom_score(
+        features_df: pd.DataFrame,
+        n_splits: int = 3,
+        lambda_risk: float = 0.5
+):
 
-    # On veut prédire ret[t+1], donc shift(-1)
-    # => On retire la dernière ligne, ou on aligne
+
     df = features_df.copy()
-    df['y'] = df['ret'].shift(-1)
-    df.dropna(inplace=True)  # retire le dernier point en trop ou tout NaN
 
+    # Rendement futur = ret[t+1]
+    df['ret_fut'] = df['ret'].shift(-1)
+
+    # Volatilité future : ici on fait un EWMA sur 'ret',
+    # puis shift(-1) pour que la vol soit la vol(t+1)
+    df['vol_fut'] = df['ret'].ewm(span=21).std().shift(-1)
+
+    # On retire les NaNs générés
+    df.dropna(inplace=True)
     if len(df) < 30:
-        # trop peu de data
         return None, 0.01, np.nan
 
-    X = df.drop(columns=['ret', 'y'])
-    y = df['y']
+    # On sépare les features X de nos 2 cibles (ret_fut, vol_fut)
+    X = df.drop(columns=['ret', 'ret_fut', 'vol_fut'])
+    y_ret = df['ret_fut']
+    y_vol = df['vol_fut']
 
-    # time series splits
+    # Cross-validation temporelle
     tscv = TimeSeriesSplit(n_splits=n_splits)
 
     all_errors = []
-    # On va stocker un model final
-    final_model = XGBRegressor(
+
+    # On définit 2 modèles XGBoost distincts
+    model_ret = XGBRegressor(
+        n_estimators=30, max_depth=2, learning_rate=0.1,
+        subsample=0.8, colsample_bytree=0.8, random_state=42
+    )
+    model_vol = XGBRegressor(
         n_estimators=30, max_depth=2, learning_rate=0.1,
         subsample=0.8, colsample_bytree=0.8, random_state=42
     )
 
+    # Boucle de CV
     for train_index, val_index in tscv.split(X):
         X_train, X_val = X.iloc[train_index], X.iloc[val_index]
-        y_train, y_val = y.iloc[train_index], y.iloc[val_index]
+        y_train_ret, y_val_ret = y_ret.iloc[train_index], y_ret.iloc[val_index]
+        y_train_vol, y_val_vol = y_vol.iloc[train_index], y_vol.iloc[val_index]
 
-        final_model.fit(
-            X_train,
-            y_train,
-            # eval_set=[(X_val, y_val)],
-            verbose=False
-        )
-        preds_val = final_model.predict(X_val)
-        mse_val = mean_squared_error(y_val, preds_val)
+        # On entraîne le premier modèle pour ret_fut
+        model_ret.fit(X_train, y_train_ret, verbose=False)
+        # On entraîne le second modèle pour vol_fut
+        model_vol.fit(X_train, y_train_vol, verbose=False)
+
+        # On prédit sur la partie validation
+        preds_ret = model_ret.predict(X_val)
+        preds_vol = model_vol.predict(X_val)
+
+        # Score prédit
+        score_pred = preds_ret - lambda_risk * preds_vol
+        # Score réel
+        score_true = y_val_ret - lambda_risk * y_val_vol
+
+        # On calcule la MSE sur le score
+        mse_val = mean_squared_error(score_true, score_pred)
         all_errors.append(mse_val)
 
-    # MSE moyenne
+    # MSE moyenne sur les folds
     mse_mean = np.mean(all_errors)
 
-    # On refit sur l'ensemble
-    final_model.fit(X, y, verbose=False)
+    # On refit les modèles sur tout le dataset
+    model_ret.fit(X, y_ret, verbose=False)
+    model_vol.fit(X, y_vol, verbose=False)
 
-    # On prédit sur le DERNIER point (on veut la vue)
-    # le dernier point du DF
-    last_row = X.iloc[[-1]]
-    pred_last = final_model.predict(last_row)[0]
+    # Prédiction finale sur la dernière ligne
+    x_last = X.iloc[[-1]]
+    r_pred = model_ret.predict(x_last)[0]
+    vol_pred = model_vol.predict(x_last)[0]
+    final_score = r_pred - lambda_risk * vol_pred
 
-    return final_model, mse_mean, pred_last
+    return (model_ret, model_vol), mse_mean, final_score
+
 
 def black_litterman_posterior(
     cov_matrix: np.ndarray,
@@ -1009,13 +1111,58 @@ def black_litterman_posterior(
 
     return mu_post
 
+def calibrate_tau(
+    cov_matrix: np.ndarray,
+    market_weights: np.ndarray,
+    Q_array: np.ndarray,
+    Omega: np.ndarray,
+    returns_in: pd.DataFrame,
+    tau_grid: list[float] = [0.01, 0.02, 0.05, 0.1, 0.2],
+    risk_aversion: float = 2.5,
+    rf_an: float = 0.02,
+    n_days: int = 252
+) -> float:
+    best_tau = None
+    best_sharpe = -999.0
+
+    n = len(market_weights)
+    # On va boucler sur chaque tau potentiel
+    for tau_test in tau_grid:
+        mu_post_test = black_litterman_posterior(
+            cov_matrix=cov_matrix,
+            market_weights=market_weights,
+            risk_aversion=risk_aversion,
+            Q=Q_array,
+            tau=tau_test,
+            Omega=Omega
+        )
+
+        # On fait un mini portefeuille 1/n
+        weights_test = np.ones(n) / n
+
+        # Perf in-sample (Sharpe)
+        pf_in = returns_in @ weights_test
+        mean_in = pf_in.mean() * n_days
+        std_in = pf_in.std() * np.sqrt(n_days)
+        if std_in > 1e-12:
+            sharpe_in = (mean_in - rf_an) / std_in
+        else:
+            sharpe_in = -999.0
+
+        if sharpe_in > best_sharpe:
+            best_sharpe = sharpe_in
+            best_tau = tau_test
+
+    return best_tau
+
+
+
 
 def rolling_backtest_tech_xgb_bl(
         returns_portfolio: pd.DataFrame,
         returns_benchmark: pd.DataFrame,
         window_size=252,
         step_size=21,
-        rf_an=0.02,
         risk_aversion=2.5,
         optimize_portfolio_func=None,
         negative_sharpe_ratio=None,
@@ -1023,53 +1170,83 @@ def rolling_backtest_tech_xgb_bl(
         combined_objective=None,
         lambda_grid=None,
         bounds=None,
-        n_days=252
+        n_days=252,
+        tau_grid=[0.01, 0.02, 0.05, 0.1, 0.2],  # <--- grille qu'on testera
+        rf_series_rolling:pd.Series=None, #pour taux sans risque dynamique
 ):
+
+
     assets = returns_portfolio.columns
     n_assets = len(assets)
     dates = returns_portfolio.index
 
-    # On suppose un marché 1/n
     market_weights = np.ones(n_assets) / n_assets
 
     results = []
+    prev_weights=None
 
     for start in range(0, len(dates) - window_size - step_size, step_size):
+        # Indices in/out
         in_idx = range(start, start + window_size)
         out_idx = range(start + window_size, start + window_size + step_size)
 
+        # Echantillons in/out
         in_sample_returns = returns_portfolio.iloc[in_idx]
         out_sample_returns = returns_portfolio.iloc[out_idx]
         in_sample_bench = returns_benchmark.iloc[in_idx]
         out_sample_bench = returns_benchmark.iloc[out_idx]
 
-        # (A) Covariance via LedoitWolf
+        #Taux sans risque dynamique in et out
+
+        if rf_series_rolling is not None:
+            rf_in = rf_series_rolling.iloc[in_idx].mean()  # Taux SR in-sample
+            rf_out = rf_series_rolling.iloc[out_idx].mean()  # Taux SR out-of-sample
+        else:
+            # fallback si pas fourni
+            rf_in = 0.02
+            rf_out = 0.02
+
+        # (A) Covariance via LedoitWolf (n_assets x n_assets)
         lw = LedoitWolf()
         lw.fit(in_sample_returns.values)
-        cov_lw = lw.covariance_  # shape (n,n)
+        cov_lw = lw.covariance_
 
-        # Pour chaque actifs => features => XGB => MSE => final pred
+        # (B) ML => Q_array, errors
         Q_array = np.zeros(n_assets)
         errors = []
 
         for i, asset in enumerate(assets):
-            # Build features
-            feat_df = build_features_for_asset(in_sample_returns[asset])  # RSI, MACD, momentum, etc.
-            # On appelle ensuite train_and_cv_xgb
-            model, mse_mean, pred_last = train_and_cv_xgb(feat_df, n_splits=3)
+            feat_df = build_features_for_asset(in_sample_returns[asset], in_sample_bench.iloc[:, 0])
+            model, mse_mean, pred_last = train_and_cv_xgb_custom_score(feat_df, n_splits=3)
             Q_array[i] = pred_last
             errors.append(mse_mean)
 
-        tau_est = np.mean(errors)
-        Omega = np.diag([tau_est] * n_assets)
+        # (B2) On fait une diagonale d’incertitude
+        #  ex. Omega = diag(tau_est_naive)
+        #  ou diag des errors (plus fin) ; ici version simple
+        tau_est_naive = np.mean(errors)
+        Omega = np.diag([tau_est_naive]*n_assets)
 
-        # (C) Black-Litterman => mu_post
+        # (C) Calibration ambition
+        best_tau = calibrate_tau(
+            cov_matrix=cov_lw,
+            market_weights=market_weights,
+            Q_array=Q_array,
+            Omega=Omega,
+            returns_in=in_sample_returns,
+            tau_grid=tau_grid,
+            risk_aversion=risk_aversion,
+            rf_an=rf_an,
+            n_days=n_days
+        )
+
+        # On recalcule mu_post avec le best_tau
         mu_post = black_litterman_posterior(
             cov_matrix=cov_lw,
             market_weights=market_weights,
             risk_aversion=risk_aversion,
             Q=Q_array,
-            tau=tau_est,
+            tau=best_tau,
             Omega=Omega
         )
 
@@ -1107,24 +1284,36 @@ def rolling_backtest_tech_xgb_bl(
         if tracking_error > 1e-12:
             IR_out = (mean_out - mean_bench_out) / tracking_error
 
+
+        #Calcul du turnover (sommme des "distances" entre les anciens poids et les nouveaux poids)
+        #Calcul la somme d'argent "perdue" via la réallocation des poids
+
+        turnover_val=0.0
+
+        if prev_weights is not None and len(prev_weights) == len(weights_opt):
+            turnover_val = sum(abs(weights_opt - prev_weights))
+
+
+        #On stock le nouveau vecteur de poids
+        prev_weights=weights_opt
         dt_test = dates[start + window_size]
         results.append({
             "Start": dt_test,
+            "Tau_chosen": best_tau,
             "Lambda": lam,
             "Sharpe_Out": sharpe_out,
-            "IR_Out": IR_out,
-            "tau_est": tau_est
+            "IR_Out": IR_out
         })
 
     df_res = pd.DataFrame(results)
     return df_res
+
 
 df_bt_ml_bl = rolling_backtest_tech_xgb_bl(
     returns_portfolio=returns_portfolio_1,
     returns_benchmark=returns_benchmark,
     window_size=252,         # Environ 1 an
     step_size=21,            # Environ 1 mois
-    rf_an=rf_an,             # taux sans risque annualisé estimé avec IRX
     risk_aversion=2.5,       # Valeur classique dans la littérature
     optimize_portfolio_func=optimize_portfolio_with_grid_search,
     negative_sharpe_ratio=negative_sharpe_ratio,
