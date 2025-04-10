@@ -1,0 +1,65 @@
+import pandas as pd
+from fredapi import Fred
+import yfinance as yf
+
+# Clé API
+fred = Fred(api_key="1749ecb70bb95c25b2c8da3e3aa70bd4")
+
+# Dossier + dates
+data_path = "C:/Users/franc/Downloads/ENSAE/Stat_app_données/"
+start_date = "2014-01-01"
+end_date = "2016-12-31"
+
+# Séries FRED macro classiques
+series_dict = {
+    "Taux_3M": "DTB3",
+    "Taux_2Y": "GS2",
+    "Taux_10Y": "GS10",
+    "CPI": "CPIAUCSL",
+    "Breakeven_5Y": "T5YIE",
+    "Nonfarm_Payrolls": "PAYEMS",
+    "Ind_Production": "INDPRO",
+    "UMich_Sentiment": "UMCSENT",
+}
+
+# Téléchargement des données principales
+macro_df = pd.DataFrame()
+for name, code in series_dict.items():
+    try:
+        data = fred.get_series(code, observation_start=start_date, observation_end=end_date)
+        macro_df[name] = data
+    except Exception as e:
+        print(f"Erreur chargement {name}: {e}")
+
+# Calcul de deltas et spreads
+macro_df["Slope_10Y_3M"] = macro_df["Taux_10Y"] - macro_df["Taux_3M"]
+macro_df["Slope_10Y_2Y"] = macro_df["Taux_10Y"] - macro_df["Taux_2Y"]
+macro_df["Real_Rate_10Y"] = macro_df["Taux_10Y"] - macro_df["CPI"]
+macro_df["Inflation_Delta_12M"] = macro_df["CPI"].pct_change(12, fill_method=None)
+
+# Ajout du VIX via Yahoo Finance
+try:
+    vix_data = yf.download("^VIX", start=start_date, end=end_date, auto_adjust=False)
+    macro_df["VIX"] = vix_data["Adj Close"]
+except Exception as e:
+    print("Erreur chargement VIX:", e)
+
+# Remplacement du spread OIS-LIBOR par NFCI
+try:
+    macro_df["NFCI"] = fred.get_series("NFCI", observation_start=start_date, observation_end=end_date)
+except Exception as e:
+    print("Erreur chargement NFCI:", e)
+
+# Ajout du STLFSI2 (indice de stress financier)
+try:
+    macro_df["Stress_Financier"] = fred.get_series("STLFSI2", start_date, end_date)
+except Exception as e:
+    print("Erreur chargement STLFSI2:", e)
+
+# Nettoyage final
+macro_df.index.name = "Date"
+macro_df = macro_df.sort_index()
+macro_df = macro_df.dropna(how="all")
+
+# Export
+macro_df.to_csv(data_path + "features_macro.csv")
