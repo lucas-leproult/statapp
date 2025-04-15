@@ -1,0 +1,1673 @@
+from statistics import mean
+import streamlit as st
+import seaborn as sns
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+from scipy.optimize import minimize
+from scipy.stats import skew
+from scipy.stats import kurtosis
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.stattools import kpss, adfuller
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from scipy.stats import normaltest, norm
+from scipy.stats import anderson
+import statsmodels.api as sm
+from arch import arch_model
+import scipy.optimize as sco
+from xgboost import XGBRegressor
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error
+from sklearn.covariance import LedoitWolf
+from sklearn.decomposition import PCA
+
+st.set_page_config(layout="wide")
+
+# Définition du chemin du dossier contenant les fichiers CSV
+data_path = "C:/Users/franc/Downloads/ENSAE/Stat_app_données/"
+
+# Vérification que les fichiers existent
+benchmark_file = os.path.join(data_path, "Df_benchmark.csv")
+portfolio_file = os.path.join(data_path, "Df_portfolio_1.csv")
+returns_benchmark_file = os.path.join(data_path, "returns_benchmark.csv")
+returns_portfolio_file = os.path.join(data_path, "returns_portfolio_1.csv")
+irx_csv_file = os.path.join(data_path, "Df_irx.csv")
+
+
+
+if not all(os.path.exists(f) for f in [benchmark_file, portfolio_file, returns_benchmark_file, returns_portfolio_file, irx_csv_file]):
+    raise FileNotFoundError("Un ou plusieurs fichiers CSV sont manquants. Assurez-vous d'avoir généré les données.")
+
+# Chargement des données depuis les fichiers CSV
+df_benchmark = pd.read_csv(benchmark_file, index_col=0, parse_dates=True)
+df_portfolio_1 = pd.read_csv(portfolio_file, index_col=0, parse_dates=True)
+returns_benchmark = pd.read_csv(returns_benchmark_file, index_col=0, parse_dates=True)
+returns_portfolio_1 = pd.read_csv(returns_portfolio_file, index_col=0, parse_dates=True)
+df_irx = pd.read_csv(irx_csv_file, index_col=0, parse_dates=True)
+df_macro=pd.read_csv(data_path + "features_macro.csv", parse_dates=["Date"], index_col="Date")
+df_macro=df_macro.resample("D").ffill()
+#normalisation des données macro
+df_macro = (df_macro - df_macro.mean()) / df_macro.std()
+df_macro.dropna(axis=1, how='any', inplace=True)
+df_macro=df_macro.loc[returns_portfolio_1.index.min():returns_portfolio_1.index.max()]
+
+# -------------------------------------------------------------------
+# 0. Affichage de l'évolution du CAC 40 sur différentes périodes
+# -------------------------------------------------------------------
+periods = [
+    ("2014-01-01", "2016-12-31"),
+    ("2017-01-01", "2019-12-31"),
+    ("2020-01-01", "2022-12-31")
+]
+
+data = {}
+for start, end in periods:
+    mask = (df_benchmark.index >= start) & (df_benchmark.index <= end)
+    data[start] = df_benchmark.loc[mask]
+
+fig, ax = plt.subplots(figsize=(12, 6))
+for i, (start, end) in enumerate(periods):
+    ax.plot(data[start].index, data[start].values, linestyle='-', marker='.', markersize=2,
+            label=f"Période {start[:4]}-{end[:4]}")
+ax.set_xlabel("Date")
+ax.set_ylabel("Cours de clôture du CAC 40")
+ax.set_title("Évolution journalière du CAC 40 sur différentes périodes de 3 ans")
+ax.legend()
+ax.grid(True)
+
+st.pyplot(fig)
+
+# -------------------------------------------------------------------
+# 1. Premiers Tests Statistiques (Moyenne, Kurtosis, skewness, Coeff de Var, donwside volatility etc... )
+#Expliquer la notion de downside vol dans le rapport
+#On rajoute la downside vol et la freq de draw downs afin de mesurer la volatilité négative du porlatefeuille
+#ainsi que la sévérité des pertes et le temps nécessaire pour récupérer
+#Pour la downside vol, il s'agit de la même formule que pour la vol sauf que l'on considère uniquement les rendements négatifs
+#Pour savoir si on doit utiliser le Sortino ou non, on devra analyser ces résultats (faire un bilan sur le rapport)
+# -------------------------------------------------------------------
+
+#Calcul de la downside vol, on prend uniquement les rendements négatifs r_i<0
+
+def downside(returns, seuil=0):
+    negative_returns=returns[returns<seuil] #on garde que les rendements négatifs
+    if len(negative_returns)==0:
+        return 0
+    return np.std(negative_returns, ddof=1)
+
+#Calcul des stats liées aux draw downs (Maximum, Durée, Fréquence)
+
+def drawdwns(returns):
+    # Calcul de l'évolution cumulée du portefeuille (capital accumulé) à chaque instant
+    cum_returns=(1+returns).cumprod()
+    #Identification du pic historique à chaque instant
+    peak=cum_returns.cummax()
+    #Calcul du draw down en pourcentage drawdown contient le drawdonw à chaque instant
+    drawdown=(cum_returns-peak)/peak
+    #Max drawdown renvoie la plus petite valeur de la série et donc le max drawdown observé
+    #Permet de connaitre la plus grande perte depuis un pic historique
+    max_drawdown= drawdown.min()
+
+    #On va maintenant identifier les périodes de drawdowns
+    is_drawdown= drawdown<0
+    #On détecte les débuts de drawdonw : lorsque False -> True
+    starts=np.where((~ is_drawdown.shift(1, fill_value=False)) & (is_drawdown))[0]
+    #On détecte les fins de drawdonw : True -> False
+    ends=np.where((is_drawdown) & (~is_drawdown.shift(-1,fill_value=False)))[0]
+
+    #Calcul de la durée moyenne des drawdowns
+    if len(starts)==0 or len(ends)==0:
+        avg_duration=0
+    else:
+        durations= ends-starts
+        avg_duration=durations.mean()
+
+    #Fréquence des drawdowns
+    frequency=len(starts)/len(returns)
+    l=[max_drawdown, avg_duration, frequency]
+
+    return l
+# Calcul des statistiques descriptives par actif
+stats_df = pd.DataFrame({
+    "Mean": returns_portfolio_1.mean(),
+    "Kurtosis": returns_portfolio_1.apply(kurtosis, axis=0),
+    "Skewness": returns_portfolio_1.apply(skew, axis=0),
+    "Coefficient of Variation": returns_portfolio_1.std() / returns_portfolio_1.mean(),
+    "Downside Volatility": returns_portfolio_1.apply(lambda col: downside(col), axis=0),
+})
+
+# Calcul des statistiques de drawdown par actif
+drawdown_stats_per_asset = returns_portfolio_1.apply(lambda col: drawdwns(col), axis=0)
+drawdown_stats_df = drawdown_stats_per_asset.T
+
+drawdown_stats_df.columns = ["Max Drawdown", "Average Duration", "Frequency"]
+
+# Fusion des statistiques générales et des statistiques de drawdown
+final_stats_df = pd.concat([stats_df, drawdown_stats_df], axis=1)
+
+# Sauvegarde dans un fichier CSV
+# Définition du chemin de sauvegarde
+output_file = "C:/Users/franc/Downloads/ENSAE/Stat_app_données/statistics_summary.csv"
+final_stats_df.to_csv(output_file)
+
+
+# -------------------------------------------------------------------
+# 2. Stationnarité, indépendance inter/intra actifs  (nécessaire pour savoir s'il est possible d'appliquer la théorie de Markowitz)
+# -------------------------------------------------------------------
+
+
+def testKPSS(tSeries, threshold=0.05):
+    """Test de stationnarité KPSS"""
+    try:
+        stat, pVal, _, _ = kpss(tSeries, nlags="auto")
+        return pVal >= threshold  # True si stationnaire, False sinon
+    except:
+        return "Error"
+
+def testADF(tSeries, threshold=0.05):
+    """Test de stationnarité ADF"""
+    try:
+        result = adfuller(tSeries)
+        pVal = result[1]  # p-value
+        return pVal < threshold  # True si stationnaire, False sinon
+    except:
+        return "Error"
+
+def testStationary(tSeries, threshold=0.05):
+    """Effectue les tests KPSS et ADF et affiche le résultat."""
+    stationaryKPSS = testKPSS(tSeries, threshold=threshold)
+    stationaryADF = testADF(tSeries, threshold=threshold)
+
+    if stationaryKPSS == "Error" or stationaryADF == "Error":
+        return "Error in test"
+    elif stationaryKPSS and stationaryADF:
+        return "The series is stationary."
+    elif not stationaryKPSS and not stationaryADF:
+        return "The series is not stationary."
+    else:
+        return "Stationary test is inconclusive."
+
+# On applique les tests de stationnarité à chaque actif du portefeuille ainsi que le Ljung Box
+#Ljung Box permet de tester les corrélations de rendements intra actifs (i.e si Cov(X_t,X_t-1)=0 ou non)
+#Pour le Ljung Box, H0: les rendements ne sont pas corrélés H1: ils le sont
+#Donc si on a une p valeur basse pour notre test, cela signifie que l'on rejette H0 avec
+#un fort niveau de confiance. En faite, la proba de rejetter H0 alors que H0 est vraie est très faible
+#Donc on fera particulièrement attention aux actifs avec une p value très basse
+stationarity_results = {col: testStationary(returns_portfolio_1[col].dropna()) for col in returns_portfolio_1.columns}
+
+
+ljung_box_results = {
+    col: acorr_ljungbox(returns_portfolio_1[col].dropna(), lags=[10], return_df=True).iloc[0, 1]  # Extraction correcte de la p-value
+    for col in returns_portfolio_1.columns
+}
+
+
+stationarity_df = pd.DataFrame.from_dict(stationarity_results, orient='index', columns=['Stationarity Result'])
+
+
+#ajout de la colonne pour le Ljung Box
+stationarity_df["Ljung-Box p-value"] = stationarity_df.index.map(ljung_box_results)
+
+# Définition du fichier de sortie
+output_path = os.path.join(data_path, "stationarity_results_portfolio.csv")
+
+# Sauvegarde des résultats dans un fichier CSV
+stationarity_df.to_csv(output_path)
+
+#Tracé des rendements de Accor, premier visu suite au test de Ljung Box, rendements corrélés entre eux
+#On investigue pour ACC,SAF et SAN
+Accor_returns = returns_portfolio_1["AC.PA"].dropna()
+Safran_returns = returns_portfolio_1["SAF.PA"].dropna()
+Capgemini_returns = returns_portfolio_1["CAP.PA"].dropna()
+Saint_gob_returns= returns_portfolio_1["SGO.PA"].dropna()
+
+#plots des rendements
+
+# Accor
+#fig1, ax1 = plt.subplots(figsize=(12, 6))
+#ax1.plot(Accor_returns, color='r', label='Rendements de Accor (AC.PA)')
+#ax1.set_xlabel('Date')
+#ax1.set_ylabel('Rendement')
+#ax1.set_title('Évolution des rendements de Accor (AC.PA)')
+#ax1.legend()
+#ax1.grid(True)
+#st.pyplot(fig1)
+
+# Safran
+#fig2, ax2 = plt.subplots(figsize=(12, 6))
+#ax2.plot(Safran_returns, color='b', label='Rendements de Safran (SAF.PA)')
+#ax2.set_xlabel('Date')
+#ax2.set_ylabel('Rendement')
+#ax2.set_title('Évolution des rendements de Safran (SAF.PA)')
+#ax2.legend()
+#ax2.grid(True)
+#st.pyplot(fig2)
+
+# Capgemini
+#fig3, ax3 = plt.subplots(figsize=(12, 6))
+#ax3.plot(Capgemini_returns , color='#6D2077', label='Rendements de Capgemini (CAP.PA)')
+#ax3.set_xlabel('Date')
+#ax3.set_ylabel('Rendement')
+#ax3.set_title('Évolution des rendements de Capgemini (CAP.PA)')
+#ax3.legend()
+#ax3.grid(True)
+#st.pyplot(fig3)
+
+# Saint-Gobain
+#fig4, ax4 = plt.subplots(figsize=(12, 6))
+#ax4.plot(Saint_gob_returns, color='#E94E1B', label='Rendements de Saint-Gobain (SGO.PA)')
+#ax4.set_xlabel('Date')
+#ax4.set_ylabel('Rendement')
+#ax4.set_title('Évolution des rendements de Saint-Gobain (SGO.PA)')
+#ax4.legend()
+#ax4.grid(True)
+#st.pyplot(fig4)
+
+#série semble stationnaire et c'est probablement le cas pour les autres on s'attend à des p values assez faibles pour
+#les tests de statio
+
+# Tracé de l'ACF pour les 4
+#plt.figure(figsize=(12, 6))
+#plot_acf(Accor_returns, lags=40, alpha=0.05, title="Autocorrelation Function (ACF) - Accor")
+#plt.show()
+
+#plt.figure(figsize=(12, 6))
+#plot_acf(Safran_returns, lags=40, alpha=0.05, title="Autocorrelation Function (ACF) - Safran")
+#plt.show()
+
+#plt.figure(figsize=(12, 6))
+#plot_acf(Capgemini_returns, lags=40, alpha=0.05, title="Autocorrelation Function (ACF) - Capgemini")
+#plt.show()
+
+#plt.figure(figsize=(12, 6))
+#plot_acf(Saint_gob_returns, lags=40, alpha=0.05, title="Autocorrelation Function (ACF) - Saint-Gobain")
+#plt.show()
+# Tracé de la PACF pour les 4
+#plt.figure(figsize=(12, 6))
+#plot_pacf(Accor_returns, lags=40, alpha=0.05, title="Partial Autocorrelation Function (PACF) - Accor")
+#plt.show()
+
+#plt.figure(figsize=(12, 6))
+#plot_pacf(Safran_returns, lags=40, alpha=0.05, title="Partial Autocorrelation Function (PACF) - Safran")
+#plt.show()
+
+#plt.figure(figsize=(12, 6))
+#plot_pacf(Capgemini_returns, lags=40, alpha=0.05, title="Partial Autocorrelation Function (PACF) - Capgemini")
+#plt.show()
+
+#plt.figure(figsize=(12, 6))
+#plot_pacf(Saint_gob_returns , lags=40, alpha=0.05, title="Partial Autocorrelation Function (PACF) - Saint-Gobain")
+#plt.show()
+
+#Selon ACF et PACF, un modèle AR(1) serait sans doute adapté
+#Pour savoir si le GARCH serait utile, on regarde la stabilité de la volatilité
+
+window_size = 20  # Fenêtre de 20 jours correspond à un mois de bourse
+rolling_volatility_a = returns_portfolio_1["AC.PA"].dropna().rolling(window=window_size).std()
+rolling_volatility_sf = returns_portfolio_1["SAF.PA"].dropna().rolling(window=window_size).std()
+rolling_volatility_cap = returns_portfolio_1["CAP.PA"].dropna().rolling(window=window_size).std()
+rolling_volatility_sgo = returns_portfolio_1["SGO.PA"].dropna().rolling(window=window_size).std()
+# AC.PA
+fig1, ax1 = plt.subplots(figsize=(12, 6))
+ax1.plot(rolling_volatility_a, color='#0057B7', label="Volatilité Mobile (20 jours) - AC.PA")
+ax1.set_xlabel("Date")
+ax1.set_ylabel("Volatilité")
+ax1.set_title("Évolution de la volatilité des rendements de AC.PA")
+ax1.legend()
+ax1.grid(True)
+st.pyplot(fig1)
+
+# SAF.PA
+fig2, ax2 = plt.subplots(figsize=(12, 6))
+ax2.plot(rolling_volatility_sf, color='red', label="Volatilité Mobile (20 jours) - SAF.PA")
+ax2.set_xlabel("Date")
+ax2.set_ylabel("Volatilité")
+ax2.set_title("Évolution de la volatilité des rendements de SAF.PA")
+ax2.legend()
+ax2.grid(True)
+st.pyplot(fig2)
+
+# CAP.PA
+fig3, ax3 = plt.subplots(figsize=(12, 6))
+ax3.plot(rolling_volatility_cap, color='#6D2077', label="Volatilité Mobile (20 jours) - CAP.PA")
+ax3.set_xlabel("Date")
+ax3.set_ylabel("Volatilité")
+ax3.set_title("Évolution de la volatilité des rendements de CAP.PA")
+ax3.legend()
+ax3.grid(True)
+st.pyplot(fig3)
+
+# SGO.PA
+fig4, ax4 = plt.subplots(figsize=(12, 6))
+ax4.plot(rolling_volatility_sgo, color='#E94E1B', label="Volatilité Mobile (20 jours) - SGO.PA")
+ax4.set_xlabel("Date")
+ax4.set_ylabel("Volatilité")
+ax4.set_title("Évolution de la volatilité des rendements de SGO.PA")
+ax4.legend()
+ax4.grid(True)
+st.pyplot(fig4)
+
+# -------------------------------------------------------------------
+# 3. Tests de normalité (Anderson-Darling + D'agostino), décision basée sur les deux tests
+# -------------------------------------------------------------------
+
+#On combine l'AD et le D'Agostino pour un test plus robuste
+
+def testAD(tSeries, threshold=0.05):
+    """Test d'Anderson-Darling pour la normalité"""
+    try:
+        result = anderson(tSeries, dist='norm')
+        stat, critical_values, significance_levels = result.statistic, result.critical_values, result.significance_level
+        # On prend le seuil critique le plus proche de threshold (5%)
+        index = (np.abs(np.array(significance_levels) - (threshold * 100))).argmin()
+        return stat < critical_values[index]  # True si normale, False sinon
+    except:
+        return "Error"
+
+def testDAgostino(tSeries, threshold=0.05):
+    """Test de D’Agostino pour la normalité"""
+    try:
+        stat, pVal = normaltest(tSeries)
+        return pVal >= threshold  # True si normale, False sinon
+    except:
+        return "Error"
+
+def testNormality(tSeries, threshold=0.05):
+    """Effectue les tests de normalité (Anderson-Darling + D’Agostino) et affiche le résultat."""
+    normalAD = testAD(tSeries, threshold)
+    normalDAgostino = testDAgostino(tSeries, threshold)
+
+    if normalAD == "Error" or normalDAgostino == "Error":
+        return "Error in test"
+    elif normalAD and normalDAgostino:
+        return "The series comes from a normal distribution."
+    elif not normalAD and not normalDAgostino:
+        return "The series does not come from a normal distribution."
+    else:
+        return "Normality test is inconclusive."
+
+normality_results = {
+    col: testNormality(returns_portfolio_1[col].dropna()) for col in returns_portfolio_1.columns
+}
+
+normality_df = pd.DataFrame.from_dict(normality_results, orient='index', columns=['Normality Result'])
+output_path = os.path.join(data_path, "normality_results_portfolio.csv")
+
+# Sauvegarde des résultats des tests de normalité dans le fichier CSV
+normality_df.to_csv(output_path)
+
+#D'après le test Ljung-Box, 3 actifs présentent avec un niveau de confiance
+#assez élevé, des rendements autocorrélés dans le temps. Les analyses d'ACF, PACF
+#et de rolling volatility ont montré que Sanofi semble avoir une volatilité plus stable
+#que Accor et Safran. Un GARCH (modifié car les rendements ne sont pas normaux)
+# serait utile pour les deux premiers actifs mais moins pour Sanofi
+#On va donc tester cette approche en gardant la vol historique pour Sanofi
+########################################
+#Problème: les rendements ne sont pas normaux donc on va devoir adapter
+#notre GARCH, Un GARCH(1,1) sous estimerait le risque
+
+#ACPA Garch t (non normalité mais kurto ok)
+#CAPPA Garch t (fat tail kurto élevé)
+#SAFPA  vérifier effet de levier
+#SGOPA  vérifier effet de levier
+
+#vérifions la présence d'un effet de levier pour SAF et SGO i.e les chocs négatifs
+#ont plus de retentissement que les chocs positifs
+
+#On calcule la volatilité conditionnelle en utilisant l'EWMA (à détailler)
+#fonction correspondante
+def ewma_volatility(returns, lambda_ewma):
+    sigma_sq = np.zeros_like(returns)
+    # Initialiser sigma_sq[0] par la variance des 20 premiers jours (si possible)
+    sigma_sq[0] = np.var(returns[:20])  #On garde une fenêtre de 20 jours
+    for t in range(1, len(returns)):
+        sigma_sq[t] = lambda_ewma * sigma_sq[t-1] + (1 - lambda_ewma) * returns[t-1]**2
+    return sigma_sq
+
+#vol conditionelle pour chaque actifs
+sigma_saf_sq = ewma_volatility(Safran_returns, 0.94)
+sigma_sgo_sq = ewma_volatility(Saint_gob_returns, 0.94)
+
+#lambdaewma=0.94 est un choix établi par RiskMetric, référence en pratique
+
+#calcul des moyennes mobiles pour mieux prendre en compte l'évolution des rendements
+mu_saf = pd.Series(Safran_returns).rolling(window=20).mean()
+mu_sgo = pd.Series(Saint_gob_returns).rolling(window=20).mean()
+
+#Calcul des chocs (epsilon_t=r_t-mu_t
+# Attention : la moyenne mobile donnera des NaN pour les premiers N-1 jours.
+epsilon_saf = Safran_returns - mu_saf
+epsilon_sgo = Saint_gob_returns - mu_sgo
+
+#On réalise la reg suivante: on red sigma_t^2 sur  epsilon_{t-1} et |epsilon_{t-1}|
+
+# Pour SAF.PA
+df_saf = pd.DataFrame({
+    'sigma_t2': sigma_saf_sq[1:],               # de t = 1 à T-1
+    'abs_epsilon_t-1': np.abs(epsilon_saf[:-1]),  # epsilon de t = 0 à T-2
+    'epsilon_t-1': epsilon_saf[:-1]
+}).dropna()
+
+# Pour SGO.PA
+df_sgo = pd.DataFrame({
+    'sigma_t2': sigma_sgo_sq[1:],               # de t = 1 à T-1
+    'abs_epsilon_t-1': np.abs(epsilon_sgo[:-1]),  # epsilon de t = 0 à T-2
+    'epsilon_t-1': epsilon_sgo[:-1]
+}).dropna()
+
+# Régression pour SAF.PA
+X_saf = sm.add_constant(df_saf[['abs_epsilon_t-1', 'epsilon_t-1']])
+y_saf = df_saf['sigma_t2']
+model_saf = sm.OLS(y_saf, X_saf).fit()
+
+# Régression pour SGO.PA
+X_sgo = sm.add_constant(df_sgo[['abs_epsilon_t-1', 'epsilon_t-1']])
+y_sgo = df_sgo['sigma_t2']
+model_sgo = sm.OLS(y_sgo, X_sgo).fit()
+
+#p valeur des tests
+p_value_saf = model_saf.pvalues['epsilon_t-1']
+p_value_sgo = model_sgo.pvalues['epsilon_t-1']
+
+#conclusions possibles
+conclusion_saf = "Présence d'effet leverage" if (p_value_saf < 0.05 and model_saf.params['epsilon_t-1'] < 0) else "Absence d'effet leverage"
+conclusion_sgo = "Présence d'effet leverage" if (p_value_sgo < 0.05 and model_sgo.params['epsilon_t-1'] < 0) else "Absence d'effet leverage"
+
+#Résultats des régressions
+print("=== SAF.PA ===")
+print(model_saf.summary())
+print("\n=== SGO.PA ===")
+print(model_sgo.summary())
+
+results_df = pd.DataFrame({
+    "Asset": ["SAF.PA", "SGO.PA"],
+    "p_value": [p_value_saf, p_value_sgo],
+    "Conclusion": [conclusion_saf, conclusion_sgo]
+})
+
+results_df.to_csv(data_path + "leverage_effect_results.csv", index=False)
+
+#on a pas d'effet de levier, on va donc faire un GARCH-t pour les 4 actifs
+assets = {
+    'AC.PA': Accor_returns,
+    'CAP.PA': Capgemini_returns,
+    'SAF.PA': Safran_returns,
+    'SGO.PA': Saint_gob_returns
+}
+garch_results = {}
+
+# Estimation d'un modèle GARCH-t pour chaque actif
+for asset, returns in assets.items():
+    # On multiplie par 100 pour exprimer les rendements en pourcentage
+    am = arch_model(returns * 100, vol='Garch', p=1, q=1, dist='t')
+    res = am.fit(disp='off')
+    garch_results[asset] = res
+
+# On extrait les paramètres estimés de chaque modèle
+garch_params = {
+    asset: res.params for asset, res in garch_results.items()
+}
+
+df_garch_params = pd.DataFrame(garch_params).T
+df_garch_params.to_csv("C:/Users/franc/Downloads/ENSAE/Stat_app_données/garch_t_results.csv")
+#Les résultats
+print(df_garch_params)
+
+# Extraction des séries de volatilité conditionnelle pour chaque actif
+garch_vol_series = {}
+for asset, res in garch_results.items():
+    # res.conditional_volatility est une Series contenant la volatilité conditionnelle (en %)
+    # On peut la laisser en pourcentage ou la diviser par 100 pour avoir la volatilité en décimal
+    garch_vol_series[asset] = res.conditional_volatility
+
+df_garch_vol = pd.DataFrame(garch_vol_series)
+#Une fois que l'on a les volatilités estimées par les GARCH
+#On va pouvoir construire une matrice de covaraince mixte
+#Avec volatilités historiques et estimées par GARCH
+
+vol_garch_annualized = {}
+for asset in ['AC.PA', 'CAP.PA', 'SAF.PA', 'SGO.PA']:
+    # Calcul de la moyenne de la série de volatilité (en %), conversion en décimal, puis annualisation
+    vol_mean_percent = df_garch_vol[asset].mean()  # en pourcentage
+    vol_decimal = vol_mean_percent / 100            # conversion en décimal
+    vol_garch_annualized[asset] = vol_decimal * np.sqrt(252)
+vol_historique_annualized = {}
+# Liste des actifs pour lesquels on n'a pas de modèle GARCH-t
+other_assets = [col for col in returns_portfolio_1 .columns if col not in ['AC.PA', 'CAP.PA', 'SAF.PA', 'SGO.PA']]
+for asset in other_assets:
+    vol_historique_annualized[asset] = returns_portfolio_1 [asset].std() * np.sqrt(252)
+
+# Fusionne les volatilités dans un dictionnaire unique
+vol_mixte_annualized = {**vol_garch_annualized, **vol_historique_annualized}
+
+#On calcul la matrice de corrélation histo
+correlation_matrix = returns_portfolio_1.corr()
+
+# On construit la matrice de covariance mixte annualisée
+# La formule utilisée : Cov(i,j) = ρ(i,j) × σ_i × σ_j
+cov_matrix_mixte = pd.DataFrame(index=vol_mixte_annualized.keys(), columns=vol_mixte_annualized.keys())
+for i in vol_mixte_annualized.keys():
+    for j in vol_mixte_annualized.keys():
+        cov_matrix_mixte.loc[i, j] = correlation_matrix.loc[i, j] * vol_mixte_annualized[i] * vol_mixte_annualized[j]
+
+# Conversion en type float par sécurité
+cov_matrix_mixte = cov_matrix_mixte.astype(float)
+
+
+
+#Affichage de la matrice de covariance mixte annualisée
+#verification de la cohérence de la matrice
+print("Matrice de covariance mixte annualisée :")
+print(cov_matrix_mixte)
+print("Test de Symétrie de la matrice de covariance mixte")
+print(np.allclose(cov_matrix_mixte, cov_matrix_mixte .T, atol=1e-8))
+print("Test de Positivité")
+def is_positive_semidefinite(matrix, atol=1e-10):
+    if not np.allclose(matrix, matrix.T, atol=atol):
+        return False  # pas symétrique
+    eigvals = np.linalg.eigvals(matrix)
+    return np.all(eigvals > -atol)
+print(is_positive_semidefinite(cov_matrix_mixte,1e-10))
+
+#Les tests renvoient TRUE donc on a bien une matrice de covariance
+#cohérente
+
+# -------------------------------------------------------------------
+# 4. Optimisation du portefeuille avec Sharpe et ERC
+# -------------------------------------------------------------------
+# Fonctions d'optimisation: RS, ERC et Sortino (pertinent si les baisses du portefeuille
+#sont plus violentes que les hausses
+
+#Question: Est-ce que dans notre cas il est pertinent de calculer le Sortino ?
+#Réponse: Oui ! Car Sur le csv on peut observer: 1) Kurt élevé >3 fréquent
+                                            #    2) Skewness nég sur plusieurs valeurs
+                                            #    3) Des Max Draw down important
+                                            #    4) Downside vol non négligeable
+def negative_sharpe_ratio(weights, mean_returns, cov_matrix, rf):
+    portfolio_return = np.dot(weights, mean_returns) #Rendements journaliers attendu du pf
+    portfolio_volatility = np.sqrt(weights.T @ cov_matrix @ weights) #volatilité du pf
+    sharpe_ratio = (portfolio_return - rf) / portfolio_volatility #RS journalier
+    return -sharpe_ratio #on minimise le RS négatif
+
+def sortino(weights, mean_returns, rf):
+    portfolio_return = np.dot(weights, mean_returns)
+    portfolio_down_vol=downside(portfolio_return , seuil=0)
+    sortino=(portfolio_return - rf) /portfolio_down_vol   # Ratio de Sortino
+    return -sortino
+
+
+
+def risk_contribution(weights, cov_matrix):
+    port_volatility = np.sqrt(weights.T @ cov_matrix @ weights)
+    marginal_contribution = (cov_matrix @ weights) / port_volatility
+    risk_contributions = weights * marginal_contribution
+    return risk_contributions
+
+
+def diversification_objective(weights, cov_matrix):
+    risk_contributions = risk_contribution(weights, cov_matrix)
+    return np.std(risk_contributions)
+
+
+def combined_objective(weights, mean_returns, cov_matrix, rf, lam):
+    return negative_sharpe_ratio(weights, mean_returns, cov_matrix, rf) + lam * diversification_objective(weights,
+                                                                                                          cov_matrix)
+
+
+
+
+# -------------------------------------------------------------------
+# 5. Estimation du taux sans risque moyen avec T-BILL
+#Calcul des statistiques nécessaires au calcul de ERC+Sharpe+IR
+# -------------------------------------------------------------------
+irx_data = df_irx["^IRX"]
+n = 88
+risk_free_daily = (1 / (1 - irx_data * n / 360)) ** (1 / n)-1
+
+S=pd.Series((risk_free_daily/100).values,index=irx_data.index) #série des rendements journaliers
+print(f"Taux sans risque moyen par jour : {mean(S) * 100:.6f}%")
+print(f"Taux sans risque annualisé : {mean(S)*252 * 100:.6f}%")
+
+rf_annualized = (1 + S) ** 252  # On annualise chaque jour
+rf_an= rf_annualized.mean() - 1  # Puis on prend la moyenne
+
+#Pour la suite on calcule également une moyenne mobile pour le taux sans risque
+
+rf_series_rolling=irx_data.rolling(window=21).mean()
+# Évolution du prix de clôture du T-Bill
+fig1, ax1 = plt.subplots(figsize=(10, 5))
+ax1.plot(irx_data.index, irx_data.values, label="Prix de clôture du T-Bill (^IRX)", color="blue")
+ax1.set_xlabel("Date")
+ax1.set_ylabel("Prix")
+ax1.set_title("Évolution du prix de clôture du T-Bill (2014-2016)")
+ax1.legend()
+ax1.grid(True)
+st.pyplot(fig1)
+
+# Taux sans risque quotidien estimé
+fig2, ax2 = plt.subplots(figsize=(10, 5))
+ax2.plot(S.index, S.values, label="Taux sans risque quotidien estimé", color="green")
+ax2.set_xlabel("Date")
+ax2.set_ylabel("Taux quotidien")
+ax2.set_title("Évolution du taux sans risque basé sur le T-Bill (2014-2016)")
+ax2.legend()
+ax2.grid(True)
+st.pyplot(fig2)
+
+
+
+n_days = 252  # Nombre de jours boursiers par an
+mean_returns = returns_portfolio_1.mean() * n_days  # Rendements annualisés des actifs
+Cov_matrix = returns_portfolio_1.cov() * n_days  # Matrice de covariance annualisée
+mean_benchmark = (returns_benchmark.mean() * n_days).iloc[0]  # Rendement annualisé du benchmark (scalaire)
+
+
+def optimize_portfolio_with_grid_search(mean_returns, cov_matrix, rf,
+                                        returns_portfolio, returns_bench,
+                                        n_days, mean_bench,
+                                        combined_objective, negative_sharpe_ratio,
+                                        downside,
+                                        lambda_grid=None,
+                                        initial_weights=None,
+                                        bounds=None,
+                                        ):
+    # Valeurs par défaut pour la grille et l'initialisation
+    if lambda_grid is None:
+        lambda_grid = np.linspace(0, 1, 21)
+    if initial_weights is None:
+        initial_weights = np.ones(len(mean_returns)) / len(mean_returns)
+    if bounds is None:
+        bounds = [(0.01, 0.4) for _ in range(len(mean_returns))]
+
+    # Définition des contraintes
+    constraints = [
+        {'type': 'eq', 'fun': lambda w: np.sum(w) - 1},
+        {'type': 'ineq', 'fun': lambda w: downside(np.dot(returns_portfolio_1, w)) - 1e-3}
+    ]
+
+    best_lambda = None
+    best_IR = -np.inf
+    best_weights = None
+    best_sharpe = -np.inf
+
+    # Parcourir la grille de lambda
+    for lam in lambda_grid:
+        res = minimize(
+            combined_objective,
+            initial_weights,
+            args=(mean_returns, cov_matrix, rf_an, lam),
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints
+        )
+
+        if res.success:
+            w_opt = res.x  # Poids optimaux pour ce lambda
+
+            # Calcul du ratio de Sharpe (on suppose que negative_sharpe_ratio renvoie le négatif)
+            sharpe_val = -negative_sharpe_ratio(w_opt, mean_returns, cov_matrix, rf_an)
+            # Calcul du rendement du portefeuille
+            port_return = np.dot(w_opt, mean_returns)
+            # Calcul du tracking error (annualisé)
+            tracking_error = np.sqrt(
+                np.mean((returns_portfolio_1 @ w_opt - returns_benchmark.iloc[:, 0]) ** 2)) * np.sqrt(n_days)
+            # Calcul de l'Information Ratio
+            IR_val = (port_return - mean_benchmark) / tracking_error
+
+            # On privilégie l'IR, et en cas d'égalité, le Sharpe
+            if IR_val.item() > best_IR or (IR_val.item() == best_IR and sharpe_val > best_sharpe):
+                best_IR = IR_val.item()
+                best_lambda = lam
+                best_weights = w_opt
+                best_sharpe = sharpe_val
+        else:
+            print("Erreur d'optimisation pour lambda =", lam, ":", res.message)
+
+    return best_lambda, best_weights, best_IR, best_sharpe
+
+best_lambda_1, best_weights_1, best_IR_1, best_sharpe_1 = optimize_portfolio_with_grid_search(
+    mean_returns, Cov_matrix, rf_an, returns_portfolio_1, returns_benchmark,
+    n_days, mean_benchmark, combined_objective, negative_sharpe_ratio, downside
+)
+
+best_lambda_2, best_weights_2, best_IR_2, best_sharpe_2 = optimize_portfolio_with_grid_search(
+    mean_returns, cov_matrix_mixte, rf_an, returns_portfolio_1, returns_benchmark,
+    n_days, mean_benchmark, combined_objective, negative_sharpe_ratio, downside
+)
+print("=== Résultats de l'optimisation ===")
+print("Meilleur lambda 1:", best_lambda_1)
+print("Poids optimaux 1:", best_weights_1)
+print("Meilleur Information Ratio (IR) 1:", best_IR_1)
+print("Meilleur Sharpe Ratio 1:", best_sharpe_1)
+
+print("=== Résultats de l'optimisation ===")
+print("Meilleur lambda 2:", best_lambda_2)
+print("Poids optimaux 2:", best_weights_2)
+print("Meilleur Information Ratio (IR) 2:", best_IR_2)
+print("Meilleur Sharpe Ratio 2:", best_sharpe_2)
+
+
+# Graphique des poids optimaux avec covariance historique
+fig1, ax1 = plt.subplots(figsize=(10, 5))
+ax1.bar(df_portfolio_1.columns, best_weights_1, color='skyblue')
+ax1.set_xlabel("Actifs")
+ax1.set_ylabel("Poids optimal")
+ax1.set_title(f"Répartition des poids ERC + Sharpe λ = {best_lambda_1:.2f}")
+ax1.tick_params(axis='x', rotation=45)
+ax1.grid(axis='y', linestyle='--', alpha=0.7)
+st.pyplot(fig1)
+
+# Graphique des poids optimaux avec covariance mixte (GARCH + historique)
+fig2, ax2 = plt.subplots(figsize=(10, 5))
+ax2.bar(df_portfolio_1.columns, best_weights_2, color='skyblue')
+ax2.set_xlabel("Actifs")
+ax2.set_ylabel("Poids optimal")
+ax2.set_title(f"Répartition des poids ERC + Sharpe λ = {best_lambda_2:.2f}")
+ax2.tick_params(axis='x', rotation=45)
+ax2.grid(axis='y', linestyle='--', alpha=0.7)
+st.pyplot(fig2)
+
+# -------------------------------------------------------------------
+# 6. Frontière efficiente
+# -------------------------------------------------------------------
+def efficient_frontier_with_portfolios(cov_matrix, returns, rf, returns_portfolio, returns_bench,
+                                       n_days, mean_bench, combined_objective, negative_sharpe_ratio, downside,
+                                       lambda_grid=None, num_portfolios=100):
+
+    best_lambda, best_weights, best_IR, best_sharpe = optimize_portfolio_with_grid_search(
+        returns, cov_matrix, rf, returns_portfolio, returns_bench, n_days, mean_bench,
+        combined_objective, negative_sharpe_ratio, downside, lambda_grid)
+
+    # Optimisation pour le portefeuille purement Sharpe
+    result_sharpe = sco.minimize(negative_sharpe_ratio, np.ones(len(returns)) / len(returns),
+                                 args=(returns, cov_matrix, rf),
+                                 method='SLSQP', bounds=[(0, 1)] * len(returns),
+                                 constraints={'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
+    weights_sharpe = result_sharpe.x if result_sharpe.success else None
+
+    # Optimisation pour le portefeuille purement ERC
+    def erc_objective(weights, cov_matrix):
+        risk_contributions = weights * (cov_matrix @ weights)
+        return np.std(risk_contributions)
+
+    result_erc = sco.minimize(erc_objective, np.ones(len(returns)) / len(returns),
+                              args=(cov_matrix,), method='SLSQP',
+                              bounds=[(0, 1)] * len(returns),
+                              constraints={'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
+    weights_erc = result_erc.x if result_erc.success else None
+
+    num_assets = cov_matrix.shape[0]
+    target_returns = np.linspace(returns.min(), returns.max(), num_portfolios)
+    efficient_portfolios = []
+
+    for target_return in target_returns:
+        constraints_target = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1},
+                              {'type': 'eq', 'fun': lambda w: w @ returns - target_return})
+        result = sco.minimize(lambda w: np.sqrt(w.T @ cov_matrix @ w),
+                              num_assets * [1. / num_assets],
+                              method='SLSQP', bounds=[(0, 1)] * num_assets,
+                              constraints=constraints_target)
+        if result.success:
+            efficient_portfolios.append((result.fun, target_return))
+
+    efficient_portfolios = np.array(efficient_portfolios)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(efficient_portfolios[:, 0], efficient_portfolios[:, 1], 'o-', label='Frontière efficiente')
+
+    if best_weights is not None:
+        ax.scatter(np.sqrt(best_weights.T @ cov_matrix @ best_weights),
+                   np.dot(best_weights, returns),
+                   color='blue', marker='D',
+                   label=f'Portefeuille ERC + Sharpe (λ={best_lambda:.2f})')
+
+    if weights_sharpe is not None:
+        ax.scatter(np.sqrt(weights_sharpe.T @ cov_matrix @ weights_sharpe),
+                   np.dot(weights_sharpe, returns),
+                   color='green', marker='s',
+                   label='Portefeuille Sharpe')
+
+    if weights_erc is not None:
+        ax.scatter(np.sqrt(weights_erc.T @ cov_matrix @ weights_erc),
+                   np.dot(weights_erc, returns),
+                   color='red', marker='o',
+                   label='Portefeuille ERC')
+
+        if weights_sharpe is not None:
+            vol_sharpe = np.sqrt(weights_sharpe.T @ cov_matrix @ weights_sharpe)
+            ret_sharpe = np.dot(weights_sharpe, mean_returns)
+            slope = (ret_sharpe - rf) / vol_sharpe if vol_sharpe > 0 else 0
+            max_vol_frontier = efficient_portfolios[:, 0].max()
+            x_cml = np.linspace(0, 2.0 * max_vol_frontier, 200)
+            y_cml = rf + slope * x_cml
+            ax.plot(x_cml, y_cml, 'k--', label='Capital Market Line')
+
+    # Limites et mise en forme
+    ax.set_xlim(0, 0.3)
+    ax.set_ylim(0, 0.4)
+    ax.set_xlabel('Risque (Écart-type)')
+    ax.set_ylabel('Rendement attendu')
+    ax.set_title('Frontière efficiente et Capital Market Line')
+    ax.legend()
+    ax.grid()
+
+    # Affichage Streamlit
+    st.pyplot(fig)
+
+
+#Essayer d'améliorer le plot pas ouf et interprétations à venir...
+
+efficient_frontier_with_portfolios(
+    cov_matrix=Cov_matrix,
+    returns=mean_returns,
+    rf=rf_an,
+    returns_portfolio=returns_portfolio_1,
+    returns_bench=returns_benchmark,
+    n_days=n_days,
+    mean_bench=mean_benchmark,
+    combined_objective=combined_objective,
+    negative_sharpe_ratio=negative_sharpe_ratio,
+    downside=downside)
+
+efficient_frontier_with_portfolios(
+    cov_matrix=cov_matrix_mixte,
+    returns=mean_returns,
+    rf=rf_an,
+    returns_portfolio=returns_portfolio_1,
+    returns_bench=returns_benchmark,
+    n_days=n_days,
+    mean_bench=mean_benchmark,
+    combined_objective=combined_objective,
+    negative_sharpe_ratio=negative_sharpe_ratio,
+    downside=downside)
+
+#On peut se dire qu'une évolution du Sharpe qui est désormais de 1.43 environ
+#Serait une bonne chose. Cependant, un piège classique est celui de l'in Sample Vs out sample
+#Et notre stratégie n'est vraiment pas bonne out of sample
+#On va donc tester une autre approche, plus robuste out of sample
+#Mais sans doute moins performante In-sample
+
+#On va utiliser une approche ML+Black Litterman (BL) on va définir plusieurs
+#Features pour nos vues
+
+#RSI
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+
+    roll_up = up.rolling(period).mean()
+    roll_down = down.rolling(period).mean()
+
+    rs = roll_up / roll_down
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+#Rolling Sharpe (1 mois)
+def compute_rolling_sharpe(series: pd.Series, window: int = 21, rf_daily: float = 0.0001):
+    excess_ret = series - rf_daily
+    rolling_mean = excess_ret.rolling(window).mean()
+    rolling_std = excess_ret.rolling(window).std()
+    return rolling_mean / rolling_std
+
+#Alpha vs benchmark (1 mois)
+def compute_alpha(series: pd.Series, benchmark: pd.Series, window: int = 21):
+    return (series - benchmark).rolling(window).mean()
+
+#Beta vs bechmarck (21 jours)
+def compute_rolling_beta(asset: pd.Series, benchmark: pd.Series, window: int = 21):
+    cov = asset.rolling(window).cov(benchmark)
+    var = benchmark.rolling(window).var()
+    return cov / var
+
+#Momentum Zscore (5j)
+def compute_momentum_zscore(series: pd.Series, window: int = 5, z_window: int = 60):
+    mom = series.diff(window)
+    mean = mom.rolling(z_window).mean()
+    std = mom.rolling(z_window).std()
+    return (mom - mean) / std
+
+#Tracking Error
+def compute_tracking_error(series: pd.Series, benchmark: pd.Series, window: int = 21):
+    diff = series - benchmark
+    return diff.rolling(window).std()
+
+#MACD
+def compute_macd(series: pd.Series, span_short=12, span_long=26, span_signal=9):
+    ema_short = series.ewm(span=span_short, adjust=False).mean()
+    ema_long = series.ewm(span=span_long, adjust=False).mean()
+    macd = ema_short - ema_long
+    signal = macd.ewm(span=span_signal, adjust=False).mean()
+    return macd, signal
+
+#Momentum
+def compute_momentum(series: pd.Series, period:int=5) -> pd.Series:
+    return series.diff(period)
+
+#Rolling std
+def compute_rolling_std(series: pd.Series, window:int=10) -> pd.Series:
+    return series.rolling(window).std()
+
+#Rendements passés
+def lag_series(series: pd.Series, lag=1) -> pd.Series:
+    return series.shift(lag)
+
+
+#oscillateur stochastique
+def compute_stoch_oscillator(series: pd.Series, window=14, d_window=3):
+    rolling_min = series.rolling(window).min()
+    rolling_max = series.rolling(window).max()
+
+    stochK = 100 * (series - rolling_min) / (rolling_max - rolling_min)
+    stochD = stochK.rolling(d_window).mean()
+
+    return stochK, stochD
+
+
+#On crée une DF de features pour chaque actif
+
+#En gros dans cette fonction on va choisir tous les "critères"
+#sur lesquels ont va baser nos predictions (c'est des regresseurs en quelques sortes)
+def build_features_for_asset(returns: pd.Series, benchmark: pd.Series, df_macro: pd.DataFrame) -> pd.DataFrame:
+
+    df = pd.DataFrame({'ret': returns})
+
+    #On aligne sur les dates de "returns" automatiquement
+
+    for col in df_macro.columns:
+        df[col]=df_macro[col].reindex(df.index)
+
+    # RSI (14)
+    df['rsi_14'] = compute_rsi(returns, 14)
+
+    # MACD
+    macd_line, macd_signal = compute_macd(returns, 12, 26, 9)
+    df['macd'] = macd_line
+    df['macd_signal'] = macd_signal
+
+    # momentum 5
+    df['mom_5'] = compute_momentum(returns, 5)
+
+    # rolling std 10
+    df['std_10'] = compute_rolling_std(returns, 10)
+
+    #vol EWMA met plus de poids sur les observations récentes
+
+    df['ewma_std_21']=returns.ewm(span=21).std()
+
+    # lags
+    df['lag1'] = lag_series(returns, 1)
+    df['lag2'] = lag_series(returns, 2)
+
+    #Stock index
+    stochK, stochD = compute_stoch_oscillator(returns, window=14, d_window=3)
+    df['stochK_14'] = stochK
+    df['stochD_14'] = stochD
+
+    #Rolling Sharpe
+    df['sharpe_21'] = compute_rolling_sharpe(returns, window=21)
+
+    #Alpha
+    df['alpha_21'] = compute_alpha(returns,benchmark , window=21)
+
+    #Beta
+    #df['beta_21'] = compute_rolling_beta(returns,benchmark)
+
+    #Zscore
+    df['mom_zscore'] = compute_momentum_zscore(returns)
+
+    #Downside
+    df['down_vol_21'] = downside(returns)
+    df["skew_21"] = returns.rolling(21).skew()
+    df["kurt_21"] = returns.rolling(21).kurt()
+
+    #Tracking Error
+    #df['te_21'] = compute_tracking_error(returns,benchmark)
+
+    df.dropna(inplace=True)
+    return df
+
+
+#Cross val + XGBoost
+def train_and_cv_xgb_custom_score(
+        features_df: pd.DataFrame,
+        n_models: int = 5,
+        lambda_risk: float = 0.5
+):
+    df = features_df.copy()
+
+    # Rendement futur = ret[t+1]
+    df['ret_fut'] = df['ret'].shift(-1)
+
+    # Volatilité future = EWMA sur ret, décalée à t+1
+    df['vol_fut'] = df['ret'].ewm(span=21).std().shift(-1)
+
+    df.dropna(inplace=True)
+    if len(df) < 30:
+        return None, 0.01, np.nan
+
+    X = df.drop(columns=['ret', 'ret_fut', 'vol_fut'])
+    y_ret = df['ret_fut']
+    y_vol = df['vol_fut']
+
+    preds_ret_all = []
+    preds_vol_all = []
+    mse_all = []
+
+    for i in range(n_models):
+        # Sous-échantillonnage temporel (80% sans replacement)
+        idx_sample = sorted(np.random.choice(len(X), size=int(0.8 * len(X)), replace=False))
+        X_train = X.iloc[idx_sample]
+        y_ret_train = y_ret.iloc[idx_sample]
+        y_vol_train = y_vol.iloc[idx_sample]
+
+        # Deux modèles XGB indépendants
+        model_ret = XGBRegressor(
+            n_estimators=30, max_depth=2, learning_rate=0.1,
+            subsample=0.8, colsample_bytree=0.8, random_state=i
+        )
+        model_vol = XGBRegressor(
+            n_estimators=30, max_depth=2, learning_rate=0.1,
+            subsample=0.8, colsample_bytree=0.8, random_state=i
+        )
+
+        model_ret.fit(X_train, y_ret_train, verbose=False)
+        model_vol.fit(X_train, y_vol_train, verbose=False)
+
+        # Prédiction sur la dernière ligne
+        x_last = X.iloc[[-1]]
+        pred_ret = model_ret.predict(x_last)[0]
+        pred_vol = model_vol.predict(x_last)[0]
+
+        preds_ret_all.append(pred_ret)
+        preds_vol_all.append(pred_vol)
+
+        # Erreur sur le score
+        score_pred = model_ret.predict(X_train) - lambda_risk * model_vol.predict(X_train)
+        score_true = y_ret_train - lambda_risk * y_vol_train
+        mse = mean_squared_error(score_true, score_pred)
+        mse_all.append(mse)
+
+    # Moyenne des prédictions
+    pred_ret_final = np.mean(preds_ret_all)
+    pred_vol_final = np.mean(preds_vol_all)
+    mse_final = np.mean(mse_all)
+    final_score = pred_ret_final - lambda_risk * pred_vol_final
+
+    return (pred_ret_final, pred_vol_final), mse_final, final_score
+
+def black_litterman_posterior(
+    cov_matrix: np.ndarray,
+    market_weights: np.ndarray,
+    risk_aversion: float,
+    Q: np.ndarray,
+    tau: float,
+    Omega: np.ndarray
+):
+    # 1) pi = risk_aversion * cov_matrix @ market_weights
+    pi = risk_aversion * cov_matrix @ market_weights
+
+    # 2) On suppose P=I => vues absolues
+    n = len(market_weights)
+    P = np.eye(n)
+
+    # 3) Inversions
+    inv_tauC = np.linalg.inv(tau * cov_matrix)
+    inv_Omega = np.linalg.inv(Omega)
+    middle = inv_tauC + P.T @ inv_Omega @ P
+    middle_inv = np.linalg.inv(middle)
+
+    right = inv_tauC @ pi + P.T @ inv_Omega @ Q
+    mu_post = middle_inv @ right
+
+    return mu_post
+
+
+def pca_before_ledoitwolf(
+    in_sample_data: np.ndarray,
+    var_explained=0.99,
+    return_details=False
+):
+    # 1) Centre les données
+    X_centered = in_sample_data - in_sample_data.mean(axis=0, keepdims=True)
+
+    # 2) Détermine le nb de composantes principales
+    pca_full = PCA()
+    pca_full.fit(X_centered)
+    cumsum = np.cumsum(pca_full.explained_variance_ratio_)
+    k = np.searchsorted(cumsum, var_explained) + 1
+
+    # 3) PCA(n_components=k)
+    pca_k = PCA(n_components=k)
+    X_reduced = pca_k.fit_transform(X_centered)
+
+    # 4) Ledoit-Wolf
+    lw = LedoitWolf()
+    lw.fit(X_reduced)
+    cov_k = lw.covariance_
+
+    # 5) Reconstruction NxN
+    U = pca_k.components_.T
+    cov_nxn = U @ cov_k @ U.T
+
+    if return_details:
+        pca_info = {
+            "explained_variance_ratio": pca_k.explained_variance_ratio_,
+            "components": pca_k.components_,
+            "n_components": k
+        }
+        return cov_nxn, pca_info
+    else:
+        return cov_nxn
+
+def calibrate_tau(
+    cov_matrix: np.ndarray,
+    market_weights: np.ndarray,
+    Q_array: np.ndarray,
+    Omega: np.ndarray,
+    returns_in: pd.DataFrame,
+    tau_grid: list[float] = [0.01, 0.02, 0.05, 0.1, 0.2],
+    risk_aversion: float = 2.5,
+    rf_an: float = 0.02,
+    n_days: int = 252
+) -> float:
+    best_tau = None
+    best_sharpe = -999.0
+
+    n = len(market_weights)
+    # On va boucler sur chaque tau potentiel
+    for tau_test in tau_grid:
+        mu_post_test = black_litterman_posterior(
+            cov_matrix=cov_matrix,
+            market_weights=market_weights,
+            risk_aversion=risk_aversion,
+            Q=Q_array,
+            tau=tau_test,
+            Omega=Omega
+        )
+
+        # On fait un mini portefeuille 1/n
+        weights_test = np.ones(n) / n
+
+        # Perf in-sample (Sharpe)
+        pf_in = returns_in @ weights_test
+        mean_in = pf_in.mean() * n_days
+        std_in = pf_in.std() * np.sqrt(n_days)
+        if std_in > 1e-12:
+            sharpe_in = (mean_in - rf_an) / std_in
+        else:
+            sharpe_in = -999.0
+
+        if sharpe_in > best_sharpe:
+            best_sharpe = sharpe_in
+            best_tau = tau_test
+
+    return best_tau
+
+
+
+def rolling_backtest_tech_xgb_bl(
+        returns_portfolio: pd.DataFrame,
+        returns_benchmark: pd.DataFrame,
+        df_macro: pd.DataFrame,
+        window_size=252,
+        step_size=21,
+        risk_aversion=2.5,
+        optimize_portfolio_func=None,
+        negative_sharpe_ratio=None,
+        downside=None,
+        combined_objective=None,
+        lambda_grid=None,
+        bounds=None,
+        n_days=252,
+        tau_grid=[0.01, 0.02, 0.05, 0.1, 0.2],  # <--- grille qu'on testera
+        rf_series_rolling:pd.Series=None, #pour taux sans risque dynamique
+):
+
+    assets = returns_portfolio.columns
+    n_assets = len(assets)
+    dates = returns_portfolio.index
+
+    market_weights = np.ones(n_assets) / n_assets
+    pca_list = []  # pour stocker les infos PCA à chaque itération
+    results = []
+    prev_weights = None
+
+    # On crée un list pour stocker les rendements journaliers oos
+    list_of_segments = []
+
+    for start in range(0, len(dates) - window_size - step_size, step_size):
+        in_idx = range(start, start + window_size)
+        out_idx = range(start + window_size, start + window_size + step_size)
+
+        in_sample_returns = returns_portfolio.iloc[in_idx]
+        out_sample_returns = returns_portfolio.iloc[out_idx]
+        in_sample_bench = returns_benchmark.iloc[in_idx]
+        out_sample_bench = returns_benchmark.iloc[out_idx]
+
+        if rf_series_rolling is not None:
+            rf_in = rf_series_rolling.iloc[in_idx].mean()
+            rf_out = rf_series_rolling.iloc[out_idx].mean()
+        else:
+            rf_in = 0.02
+            rf_out = 0.02
+
+        # (A) ACP + Ledoit-Wolf sur l’espace réduit + pca_info
+        cov_lw, pca_info = pca_before_ledoitwolf(
+            in_sample_data=in_sample_returns.values,
+            var_explained=0.90,
+            return_details=True
+        )
+        cov_lw += 1e-6 * np.eye(n_assets)
+
+        # On stocke dans pca_list
+        pca_list.append({
+            "window_start": dates[start],
+            "window_end": dates[start + window_size],
+            "explained_variance_ratio": pca_info["explained_variance_ratio"]})
+
+        # (B) ML => Q_array, errors
+        Q_array = np.zeros(n_assets)
+        errors = []
+        for i, asset in enumerate(assets):
+            feat_df = build_features_for_asset(
+                in_sample_returns[asset],
+                in_sample_bench.iloc[:, 0],
+                df_macro.loc[in_sample_returns.index]  # aligne bien les dates ici
+            )
+
+            if feat_df is None or feat_df.empty:
+                continue  # skip cet actif
+
+            result = train_and_cv_xgb_custom_score(feat_df, n_models=5, lambda_risk=0.5)
+            if result is None or np.isnan(result[2]):
+                continue
+
+            model, mse_mean, pred_last = result
+            Q_array[i] = pred_last
+            errors.append(mse_mean)
+
+        tau_est_naive = np.mean(errors)
+        Omega = np.diag([tau_est_naive] * n_assets)
+
+        # (C) Calibration ambition
+        best_tau = calibrate_tau(
+            cov_matrix=cov_lw,
+            market_weights=market_weights,
+            Q_array=Q_array,
+            Omega=Omega,
+            returns_in=in_sample_returns,
+            tau_grid=tau_grid,
+            risk_aversion=risk_aversion,
+            rf_an=0.02,  # ou rf_in si tu veux, selon ta logique
+            n_days=n_days
+        )
+
+        # On recalcule mu_post avec le best_tau
+        mu_post = black_litterman_posterior(
+            cov_matrix=cov_lw,
+            market_weights=market_weights,
+            risk_aversion=risk_aversion,
+            Q=Q_array,
+            tau=best_tau,
+            Omega=Omega
+        )
+
+        mu_post_series = pd.Series(mu_post, index=assets)
+        mean_bench_in = in_sample_bench.mean().iloc[0] * n_days
+
+        # (D) Optimisation ERC+Sharpe => weights
+        lam, weights_opt, IR_in, sharpe_in = optimize_portfolio_func(
+            mu_post_series,
+            pd.DataFrame(cov_lw, index=assets, columns=assets),
+            0.02,  # ou rf_an
+            in_sample_returns,
+            in_sample_bench,
+            n_days,
+            mean_bench_in,
+            combined_objective,
+            negative_sharpe_ratio,
+            downside,
+            lambda_grid=lambda_grid,
+            bounds=bounds
+        )
+
+        # (E) Perf out-of-sample
+        if weights_opt is None or len(weights_opt) != n_assets:
+            continue  # skip cette fenêtre si les poids sont mal définis
+        pf_out = out_sample_returns @ weights_opt
+        mean_out = pf_out.mean() * n_days
+        std_out = pf_out.std() * np.sqrt(n_days)
+        sharpe_out = np.nan
+        if std_out > 1e-12:
+            sharpe_out = (mean_out - 0.02) / std_out  # ou (mean_out - rf_an), etc
+
+        out_bench_vals = out_sample_bench.iloc[:, 0]
+        mean_bench_out = out_bench_vals.mean() * n_days
+        tracking_error = (pf_out - out_bench_vals).std() * np.sqrt(n_days)
+        IR_out = np.nan
+        if tracking_error > 1e-12:
+            IR_out = (mean_out - mean_bench_out) / tracking_error
+
+        turnover_val = 0.0
+        if prev_weights is not None and len(prev_weights) == len(weights_opt):
+            turnover_val = sum(abs(weights_opt - prev_weights))
+
+        prev_weights = weights_opt
+        dt_test = dates[start + window_size]
+        results.append({
+            "Start": dt_test,
+            "Tau_chosen": best_tau,
+            "Lambda": lam,
+            "Sharpe_Out": sharpe_out,
+            "IR_Out": IR_out,
+            "Turnover": turnover_val
+        })
+
+        # On stocke la série journalière out-of-sample dans list_of_segments
+        pf_out.name = "pf_out"
+        list_of_segments.append(pf_out)
+
+    df_res = pd.DataFrame(results)
+
+    # Concat des rendements journaliers
+    daily_pf_out = pd.concat(list_of_segments)
+    daily_pf_out.name = "Daily_Portfolio_Returns"
+
+    return df_res, daily_pf_out, pca_list
+
+
+##Lancement du Backtest + Dashboard
+
+
+st.title("Dashboard ML + Black-Litterman + Monitoring")
+
+st.subheader("1) Lancement du backtest rolling")
+run_backtest = st.button("Run Backtest Rolling")
+
+if run_backtest:
+    # On prépare le rolling backtest
+    df_bt_ml_bl, daily_pf_out, pca_list= rolling_backtest_tech_xgb_bl(
+        returns_portfolio=returns_portfolio_1,
+        returns_benchmark=returns_benchmark,
+        df_macro= df_macro,
+        window_size=252,
+        step_size=21,
+        risk_aversion=2.5,
+        optimize_portfolio_func=optimize_portfolio_with_grid_search,
+        negative_sharpe_ratio=negative_sharpe_ratio,
+        downside=downside,
+        combined_objective=combined_objective,
+        lambda_grid=np.linspace(0, 1, 5),
+        bounds=[(0.01,0.4)]*returns_portfolio_1.shape[1],
+        n_days=252,
+        tau_grid=[0.01,0.02,0.05,0.1],
+        rf_series_rolling=None
+    )
+    st.success("Backtest terminé !")
+
+    # Petites stats globales
+    mean_sharpe = df_bt_ml_bl["Sharpe_Out"].mean()
+    mean_ir = df_bt_ml_bl["IR_Out"].mean()
+    st.metric("Sharpe Out-of-Sample (moyen)", f"{mean_sharpe:.2f}")
+    st.metric("IR Out-of-Sample (moyen)", f"{mean_ir:.2f}")
+
+    # Détection si 3 Sharpe OOS < 0 de suite
+    df_bt_ml_bl["Sharpe_3roll"] = df_bt_ml_bl["Sharpe_Out"].rolling(3).mean()
+    df_bt_ml_bl["StopRebalance"] = df_bt_ml_bl["Sharpe_3roll"] < 0
+
+    # Affichage du DataFrame
+    st.dataframe(df_bt_ml_bl)
+
+    # Graphique
+    st.subheader("Évolution Sharpe et IR")
+    fig, ax = plt.subplots(figsize=(10,5))
+    ax.plot(df_bt_ml_bl["Start"], df_bt_ml_bl["Sharpe_Out"], label="Sharpe OOS", marker='o')
+    ax.plot(df_bt_ml_bl["Start"], df_bt_ml_bl["IR_Out"], label="IR OOS", marker='s')
+    ax.axhline(0, color='black', linestyle='--')
+    ax.set_title("Stratégie ML + BL : Sharpe vs IR OOS")
+    ax.set_xlabel("Date")
+    ax.legend()
+    ax.grid(True)
+    st.pyplot(fig)
+
+    # Turnover
+    st.subheader("Turnover par période")
+    fig2, ax2 = plt.subplots(figsize=(10,4))
+    ax2.bar(df_bt_ml_bl["Start"], df_bt_ml_bl["Turnover"], color='orange')
+    ax2.set_title("Turnover")
+    ax2.set_xlabel("Date")
+    ax2.set_ylabel("Turnover (somme des |∆w|)")
+    ax2.grid(True)
+    st.pyplot(fig2)
+
+    # Fenêtres Stop
+    st.subheader("Fenêtres où Sharpe_3roll < 0 (arrêt possible du rebalancing)")
+    df_stop = df_bt_ml_bl[df_bt_ml_bl["StopRebalance"] == True]
+    st.dataframe(df_stop)
+
+    ##Evolution de la variance PC1, PC2, PC3
+    explained_variances_over_time = []
+    for i, d in enumerate(pca_list):
+        row = {
+            "window_id": i,
+            "window_start": d["window_start"],
+            "window_end": d["window_end"]
+        }
+        var_ratio = d["explained_variance_ratio"]
+        # on suppose au moins 3 composantes
+        row["PC1_var"] = var_ratio[0]
+        row["PC2_var"] = var_ratio[1] if len(var_ratio) > 1 else 0
+        row["PC3_var"] = var_ratio[2] if len(var_ratio) > 2 else 0
+        explained_variances_over_time.append(row)
+
+    df_var = pd.DataFrame(explained_variances_over_time).set_index("window_id")
+
+    fig_pca, ax_pca = plt.subplots(figsize=(10, 4))
+    ax_pca.plot(df_var.index, df_var["PC1_var"], label="PC1")
+    ax_pca.plot(df_var.index, df_var["PC2_var"], label="PC2")
+    ax_pca.plot(df_var.index, df_var["PC3_var"], label="PC3")
+    ax_pca.set_xlabel("Index de fenêtre rolling")
+    ax_pca.set_ylabel("Proportion variance expliquée")
+    ax_pca.set_title("Évolution de la variance expliquée (ACP) sur chaque fenêtre")
+    ax_pca.legend()
+    ax_pca.grid(True)
+    st.pyplot(fig_pca)
+
+    # -------------------------------------------------------------------
+    # CALCUL DU PnL ET DU CAPITAL EN INTÉGRANT LES FRAIS DE TRANSACTION
+    # -------------------------------------------------------------------
+
+    # Paramètres
+    initial_capital = 100_000  # Montant initial investi
+    transaction_cost_rate = 0.001  # 10 bps = 0,1% cohérent avec actifs du CAC40 + en supposant que le broker soit compétitif
+
+    # On va construire une liste (Date, Capital) pour recréer la courbe
+    capital_records = []
+    cap = initial_capital
+
+    # Pour éviter les doublons, on enregistre la date de départ
+    capital_records.append((daily_pf_out.index[0], cap))
+
+    # Boucle sur chaque fenêtre out-of-sample décrite dans df_bt_ml_bl
+    for i in range(len(df_bt_ml_bl)):
+        # Récupère la date de début de la fenêtre out-of-sample
+        start_date = df_bt_ml_bl.iloc[i]["Start"]
+
+        # Pour la date de fin, on regarde la fenêtre suivante,
+        # sauf pour la dernière qui va jusqu'à la fin de daily_pf_out
+        if i < len(df_bt_ml_bl) - 1:
+            end_date = df_bt_ml_bl.iloc[i + 1]["Start"]
+            # Segment de rendements entre [start_date, end_date)
+            seg_ret = daily_pf_out.loc[start_date:end_date]
+        else:
+            # Dernier segment => jusqu’à la fin de la série daily_pf_out
+            seg_ret = daily_pf_out.loc[start_date:]
+
+        # (A) On fait évoluer le capital chaque jour du segment
+        for date, ret_jour in seg_ret.items():
+            cap *= (1 + ret_jour)  # capital(t) = capital(t-1) * (1 + r_t)
+            capital_records.append((date, cap))
+
+        # (B) On applique les frais de transaction en fin de segment,
+        #     selon le Turnover indiqué dans df_bt_ml_bl
+        turnover_val = df_bt_ml_bl.iloc[i]["Turnover"]
+        fees = cap * turnover_val * transaction_cost_rate
+        cap -= fees  # on soustrait ces frais
+
+        # Optionnel : on enregistre le capital après frais à la dernière date du segment
+        if len(seg_ret) > 0:
+            last_date_of_segment = seg_ret.index[-1]
+            capital_records.append((last_date_of_segment, cap))
+
+    # -------------------------------------------------------------------
+    # 2) Construction d'une DataFrame Capital + PnL Quotidien
+    # -------------------------------------------------------------------
+    cap_df = pd.DataFrame(capital_records, columns=["Date", "Capital"])
+    # Évite les doublons si la même date apparaît 2 fois
+    cap_df = cap_df.drop_duplicates(subset=["Date"]).set_index("Date").sort_index()
+
+    # PnL quotidien = variation absolue de Capital d'un jour à l'autre
+    cap_df["PnL_daily"] = cap_df["Capital"].diff().fillna(cap_df["Capital"].iloc[0] - initial_capital)
+
+    # -------------------------------------------------------------------
+    # 3) Affichage dans Streamlit
+    # -------------------------------------------------------------------
+    st.subheader("Capital cumulé (avec frais de 10 bps à chaque rééquilibrage)")
+
+    fig_cap, ax_cap = plt.subplots(figsize=(10, 5))
+    ax_cap.plot(cap_df.index, cap_df["Capital"], label="Capital avec frais", color="blue")
+    ax_cap.set_title("Évolution du capital (frais déduits après chaque Turnover)")
+    ax_cap.set_xlabel("Date")
+    ax_cap.set_ylabel("Capital (€)")
+    ax_cap.legend()
+    ax_cap.grid(True)
+    st.pyplot(fig_cap)
+
+    st.subheader("PnL quotidien (avec frais)")
+
+    fig_pnl, ax_pnl = plt.subplots(figsize=(10, 5))
+    ax_pnl.plot(cap_df.index, cap_df["PnL_daily"], label="PnL quotidien", color="orange")
+    ax_pnl.axhline(0, color="red", linestyle="--")
+    ax_pnl.set_title("Évolution du PnL quotidien (frais inclus)")
+    ax_pnl.set_xlabel("Date")
+    ax_pnl.set_ylabel("PnL (€)")
+    ax_pnl.legend()
+    ax_pnl.grid(True)
+    st.pyplot(fig_pnl)
+
+    # -------------------------------------------------------------------
+    # 4) Résultats finaux
+    # -------------------------------------------------------------------
+    final_capital = cap_df["Capital"].iloc[-1]
+    final_pnl = final_capital - initial_capital
+    st.write(f"**Capital final** : {final_capital:,.2f} €")
+    st.write(f"**PnL final** : {final_pnl:,.2f} €")
+    st.write(f"**Performance totale** : {((final_capital / initial_capital) - 1) * 100:.2f} %")
+
+    # Recalcule drawdown à partir de 'cap_df["Capital"]'
+    capital_series = cap_df["Capital"]  # On prend la série du capital post-frais
+    peak = capital_series.cummax()  # Pic historique à chaque date
+    drawdown = capital_series / peak - 1  # Calcul du drawdown (en fraction, < 0)
+
+
+    # Plot drawdown
+    fig_dd, ax_dd = plt.subplots(figsize=(10, 4))
+    ax_dd.plot(drawdown.index, drawdown, label="Drawdown", color='red')
+    ax_dd.axhline(0, linestyle='--', color='black')
+    ax_dd.set_title("Drawdown cumulatif")
+    ax_dd.set_xlabel("Date")
+    ax_dd.set_ylabel("Drawdown (%)")
+    ax_dd.legend()
+    ax_dd.grid(True)
+    st.pyplot(fig_dd)
+
+    # Histogramme mensuel
+    monthly_returns = daily_pf_out.resample('M').apply(lambda x: (x + 1).prod() - 1)
+    fig_hist, ax_hist = plt.subplots(figsize=(10, 4))
+    ax_hist.hist(monthly_returns, bins=20, edgecolor='black')
+    ax_hist.set_title("Histogramme des rendements mensuels")
+    ax_hist.set_xlabel("Rendement mensuel")
+    ax_hist.set_ylabel("Fréquence")
+    ax_hist.grid(True)
+    st.pyplot(fig_hist)
+
+    # -------------------------------------------------------------
+    # SECTION : VaR / CVaR out-of-sample sur daily_pf_out
+    # -------------------------------------------------------------
+    st.subheader("Analyse du risque extrême : VaR & CVaR Out-of-Sample")
+
+    alpha = 0.05  # niveau de confiance 5%
+
+    # On trie les rendements journaliers out-of-sample
+    sorted_returns = daily_pf_out.sort_values()
+
+    # Calcul VaR empirique à 5% : quantile
+    var_5 = sorted_returns.quantile(alpha)
+
+    # Calcul CVaR empirique : moyenne des pires 5%
+    cvar_5 = sorted_returns[sorted_returns <= var_5].mean()
+
+    # Affichage Streamlit
+    st.metric("VaR à 5%", f"{var_5:.2%}")
+    st.metric("CVaR à 5%", f"{cvar_5:.2%}")
+
+    # Visualisation
+    fig_var, ax_var = plt.subplots(figsize=(10, 4))
+    ax_var.hist(daily_pf_out, bins=50, alpha=0.7, color='skyblue', edgecolor='black')
+    ax_var.axvline(var_5, color='red', linestyle='--', label=f"VaR 5% = {var_5:.2%}")
+    ax_var.axvline(cvar_5, color='darkred', linestyle='-', label=f"CVaR 5% = {cvar_5:.2%}")
+    ax_var.set_title("Distribution des rendements journaliers OOS\navec VaR / CVaR à 5%")
+    ax_var.set_xlabel("Rendement journalier")
+    ax_var.set_ylabel("Fréquence")
+    ax_var.legend()
+    ax_var.grid(True)
+    st.pyplot(fig_var)
+
+    #Comparaison au Benchmark
+
+    benchmark_oos = returns_benchmark.loc[daily_pf_out.index].iloc[:, 0]
+    var_bench = benchmark_oos.quantile(alpha)
+    cvar_bench = benchmark_oos[benchmark_oos <= var_bench].mean()
+
+    st.metric("VaR 5% Benchmark", f"{var_bench:.2%}")
+    st.metric("CVaR 5% Benchmark", f"{cvar_bench:.2%}")
+
+
+    def rolling_var_cvar(series_returns: pd.Series, alpha=0.05, window=126):
+        rolling_var = []
+        rolling_cvar = []
+
+        for i in range(window, len(series_returns)):
+            window_data = series_returns.iloc[i - window:i]
+            sorted_losses = window_data.sort_values()
+            var_value = sorted_losses.quantile(alpha)
+            cvar_value = sorted_losses[sorted_losses <= var_value].mean()
+            rolling_var.append(var_value)
+            rolling_cvar.append(cvar_value)
+
+        dates = series_returns.index[window:]
+        return pd.Series(rolling_var, index=dates), pd.Series(rolling_cvar, index=dates)
+
+
+    # Calcule Rolling VaR / CVaR pour le portefeuille OOS
+    rolling_var_pf, rolling_cvar_pf = rolling_var_cvar(daily_pf_out, alpha=0.05, window=126)
+
+    # Graphique Streamlit
+    st.subheader("Analyse dynamique du risque extrême (Rolling VaR / CVaR à 5%)")
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(rolling_var_pf.index, rolling_var_pf * 100, label="Rolling VaR 5%", linestyle='--', color='red')
+    ax.plot(rolling_cvar_pf.index, rolling_cvar_pf * 100, label="Rolling CVaR 5%", linestyle='-', color='darkred')
+    ax.set_title("Rolling VaR / CVaR à 5% (Fenêtre 6 mois)")
+    ax.set_ylabel("Rendement (%)")
+    ax.set_xlabel("Date")
+    ax.legend()
+    ax.grid(True)
+    st.pyplot(fig)
+
+
+
+
+
+else:
+    st.info("Cliquer sur 'Run Backtest Rolling' pour lancer la stratégie et afficher le dashboard.")
